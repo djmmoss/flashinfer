@@ -9,13 +9,11 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      workflows: write
     steps:
       - name: Sync fork with upstream
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.PAT_TOKEN }}
           script: |
             await github.rest.repos.mergeUpstream({
               owner: context.repo.owner,
