@@ -2695,7 +2695,7 @@ Examples:
     parser.add_argument("--num-q-heads", type=int, default=16)
     parser.add_argument("--num-k-heads", type=int, default=16)
     parser.add_argument("--num-v-heads", type=int, default=32)
-    parser.add_argument("--head-size", type=int, default=128)
+    parser.add_argument("--head-size", type=int, default=128, choices=[64, 128])
     parser.add_argument(
         "--dtype", type=str, choices=["float16", "bfloat16"], default="bfloat16"
     )

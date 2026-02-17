@@ -13,21 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Gated Delta Rule Decode Kernel (BF16 Hidden State) - CuTe-DSL Implementation
-============================================================================
+KDA (Key-Driven Attention) Decode Kernel using CuTe-DSL
+========================================================
 
-RELOCATED: This file was previously located at flashinfer/cute_dsl/gated_delta_rule.py
-           and has been moved to flashinfer/gdn_decode/gdn_decode_bf16_state.py
-           to better reflect its domain-specific purpose (GDN decode with BF16 state).
-
-High-performance CUDA kernel implementing the Gated Delta Rule linear attention
-mechanism for decode-phase inference, supporting sequence lengths T=1, T=2, T=3, T=4.
+High-performance CUDA kernel implementing the KDA (Key-Driven Attention) decode
+mechanism with per-K-dimension gating, supporting sequence lengths T=1, T=2, T=3, T=4.
 
 Key Features:
 - Unified kernel architecture: T=2/3/4 share a single compile-time specialized kernel
   using Constexpr dispatch, while T=1 uses a separate kernel with persistent K-in-registers
 - L2-normalized Q/K with configurable scale
-- Gated exponential decay of hidden state H via softplus
+- Pre-computed log-space gate g[B,T,HV,K] and pre-sigmoided beta[B,T,HV]
 - Delta rule updates: v_delta = beta * (v - pred)
 - Bank-conflict-free cross-warp reductions
 - Async H memory loading with aggressive pipelining
@@ -60,37 +56,37 @@ from flashinfer.gdn_kernels._common import (
     cross_warp_reduce_two,
 )
 
+# TVM FFI: eliminates DLPack overhead by passing torch.Tensor directly
+try:
+    import tvm_ffi  # noqa: F401
 
-# ==============================================================================
-# GDN-SPECIFIC FUNCTIONS (scalar gate)
-# ==============================================================================
+    _HAS_TVM_FFI = True
+except ImportError:
+    _HAS_TVM_FFI = False
+
+
+# KDA-SPECIFIC FUNCTIONS (per-K gate)
 
 
 @cute.jit
-def compute_single_gate(
-    alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-):
-    """Compute gate values (g_exp, beta) for a single token."""
-    x = alpha + dt_bias_val
-    beta_x = softplus_beta * x
-    softplus_x = cutlass.Float32(0.0)
-    if beta_x <= softplus_threshold:
-        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True), fastmath=True
-        )
-    else:
-        softplus_x = x
-    g = -cute.exp(A_log_val, fastmath=True) * softplus_x
-    g_exp = cute.exp(g, fastmath=True)
-    beta = cutlass.Float32(1.0) / (
-        cutlass.Float32(1.0) + cute.exp(-beta_raw, fastmath=True)
-    )
-    return g_exp, beta
+def load_g_exp_chunk(g_exp_chunk, g_head, k_base):
+    """Load pre-computed log-space gate from global memory and exponentiate.
+
+    Args:
+        g_exp_chunk: output register tensor (32,) Float32
+        g_head: global gate tensor slice [K=HEAD_DIM], BFloat16
+        k_base: starting K index for this warp (warp_idx * 32)
+    """
+    for i in cutlass.range_constexpr(0, 32, 2):
+        g_val_0 = g_head[k_base + i].to(cutlass.Float32)
+        g_val_1 = g_head[k_base + i + 1].to(cutlass.Float32)
+        g_exp_chunk[i] = cute.exp(g_val_0, fastmath=True)
+        g_exp_chunk[i + 1] = cute.exp(g_val_1, fastmath=True)
 
 
 @cute.jit
 def decay_h_from_smem_and_compute_pred(
-    h_sh_chunk, h_chunk, kq_chunk, g_exp, lane_idx, k_base
+    h_sh_chunk, h_chunk, kq_chunk, g_exp_chunk, lane_idx, k_base
 ):
     """Load H from SMEM, apply decay, and compute pred = sum_k(h * k)."""
     pred = cutlass.Float32(0.0)
@@ -102,7 +98,7 @@ def decay_h_from_smem_and_compute_pred(
                 h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
                 h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
             ),
-            src_b=(g_exp, g_exp),
+            src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
             src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
         )
 
@@ -118,12 +114,12 @@ def decay_h_from_smem_and_compute_pred(
 
 
 @cute.jit
-def decay_h_in_place(h_chunk, g_exp):
+def decay_h_in_place(h_chunk, g_exp_chunk):
     """Apply decay to H in place: h = h * g_exp."""
     for i in cutlass.range_constexpr(0, 32, 2):
         h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
             src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(g_exp, g_exp),
+            src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
             src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
         )
 
@@ -133,12 +129,13 @@ def process_first_token(
     h_sh_chunk_curr,
     h_chunk,
     kq_chunk,
+    g_exp_chunk,
     k_sh,
     q_sh,
     v_sh,
     reduce_sh,
     o_head,
-    g_exp,
+    g_head,
     beta,
     v_offset,
     pred_slot,
@@ -149,6 +146,7 @@ def process_first_token(
 ):
     """
     Process the first token in a V-chunk (T=0).
+    - Load pre-computed gate from global memory
     - Load K from SMEM
     - Decay H from SMEM and compute pred
     - Cross-warp reduce pred (uses pred_slot)
@@ -156,12 +154,15 @@ def process_first_token(
     - Load Q and compute output
     Returns: out (partial output, not yet reduced)
     """
+    # Load pre-computed per-K gate vector from global memory
+    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
+
     # Load K for this token
     load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
 
     # Decay H from SMEM and compute pred = H * K
     pred = decay_h_from_smem_and_compute_pred(
-        h_sh_chunk_curr, h_chunk, kq_chunk, g_exp, lane_idx, k_base
+        h_sh_chunk_curr, h_chunk, kq_chunk, g_exp_chunk, lane_idx, k_base
     )
 
     # Reduce pred across warps (slot 0 for first token)
@@ -184,12 +185,13 @@ def process_first_token(
 def process_middle_token(
     h_chunk,
     kq_chunk,
+    g_exp_chunk,
     k_sh,
     q_sh,
     v_sh,
     reduce_sh,
     o_head_prev,
-    g_exp,
+    g_head,
     beta,
     v_offset,
     out_slot_prev,
@@ -202,6 +204,7 @@ def process_middle_token(
 ):
     """
     Process a middle token (T=1, T=2 for T=4 kernel).
+    - Load pre-computed gate from global memory
     - Decay H in place
     - Load K, compute pred
     - Joint reduction of (prev_out, this_pred)
@@ -210,8 +213,11 @@ def process_middle_token(
     - Load Q and compute output
     Returns: out (partial output, not yet reduced)
     """
+    # Load pre-computed per-K gate vector from global memory
+    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
+
     # Decay H in place
-    decay_h_in_place(h_chunk, g_exp)
+    decay_h_in_place(h_chunk, g_exp_chunk)
 
     # Load K and compute pred
     load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
@@ -249,13 +255,14 @@ def process_last_token_and_finish(
     h_sh_chunk_curr,
     h_chunk,
     kq_chunk,
+    g_exp_chunk,
     k_sh,
     q_sh,
     v_sh,
     reduce_sh,
     o_head_prev,
     o_head_last,
-    g_exp,
+    g_head,
     beta,
     v_offset,
     out_slot_prev,
@@ -269,6 +276,7 @@ def process_last_token_and_finish(
 ):
     """
     Process the last token and finalize the V-chunk.
+    - Load pre-computed gate from global memory
     - Decay H in place
     - Load K, compute pred
     - Joint reduction of (prev_out, this_pred)
@@ -278,8 +286,11 @@ def process_last_token_and_finish(
     - Write H back to SMEM
     - Store last output
     """
+    # Load pre-computed per-K gate vector from global memory
+    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
+
     # Decay H in place
-    decay_h_in_place(h_chunk, g_exp)
+    decay_h_in_place(h_chunk, g_exp_chunk)
 
     # Load K and compute pred
     load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
@@ -330,6 +341,7 @@ def process_vchunk_unified_234(
     h_out,
     h_chunk,
     kq_chunk,
+    g_exp_chunk,
     k_sh0,
     k_sh1,
     k_sh2,
@@ -347,10 +359,10 @@ def process_vchunk_unified_234(
     o_head1,
     o_head2,
     o_head3,
-    g_exp0,
-    g_exp1,
-    g_exp2,
-    g_exp3,
+    g_head0,
+    g_head1,
+    g_head2,
+    g_head3,
     beta0,
     beta1,
     beta2,
@@ -385,12 +397,13 @@ def process_vchunk_unified_234(
         h_sh_chunk_curr,
         h_chunk,
         kq_chunk,
+        g_exp_chunk,
         k_sh0,
         q_sh0,
         v_sh0,
         reduce_sh,
         o_head0,
-        g_exp0,
+        g_head0,
         beta0,
         v_offset,
         0,  # pred_slot=0
@@ -407,13 +420,14 @@ def process_vchunk_unified_234(
             h_sh_chunk_curr,
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh1,
             q_sh1,
             v_sh1,
             reduce_sh,
             o_head0,
             o_head1,
-            g_exp1,
+            g_head1,
             beta1,
             v_offset,
             1,
@@ -430,12 +444,13 @@ def process_vchunk_unified_234(
         out1 = process_middle_token(
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh1,
             q_sh1,
             v_sh1,
             reduce_sh,
             o_head0,
-            g_exp1,
+            g_head1,
             beta1,
             v_offset,
             1,
@@ -450,13 +465,14 @@ def process_vchunk_unified_234(
             h_sh_chunk_curr,
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh2,
             q_sh2,
             v_sh2,
             reduce_sh,
             o_head1,
             o_head2,
-            g_exp2,
+            g_head2,
             beta2,
             v_offset,
             3,
@@ -473,12 +489,13 @@ def process_vchunk_unified_234(
         out1 = process_middle_token(
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh1,
             q_sh1,
             v_sh1,
             reduce_sh,
             o_head0,
-            g_exp1,
+            g_head1,
             beta1,
             v_offset,
             1,
@@ -492,12 +509,13 @@ def process_vchunk_unified_234(
         out2 = process_middle_token(
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh2,
             q_sh2,
             v_sh2,
             reduce_sh,
             o_head1,
-            g_exp2,
+            g_head2,
             beta2,
             v_offset,
             3,
@@ -513,13 +531,14 @@ def process_vchunk_unified_234(
             h_sh_chunk_curr,
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh3,
             q_sh3,
             v_sh3,
             reduce_sh,
             o_head2,
             o_head3,
-            g_exp3,
+            g_head3,
             beta3,
             v_offset,
             5,
@@ -543,15 +562,11 @@ def gated_delta_rule_decode_kernel_seqlen1(
     gQ: cute.Tensor,
     gK: cute.Tensor,
     gV: cute.Tensor,
-    ga: cute.Tensor,
-    gb: cute.Tensor,
-    gA_log: cute.Tensor,
-    gdt_bias: cute.Tensor,
+    gG: cute.Tensor,  # [B, T, HV, K] log-space gate
+    gBeta: cute.Tensor,  # [B, T, HV] pre-sigmoided
     gH: cute.Tensor,
     gO: cute.Tensor,
     scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
     eps: cutlass.Float32,
     HEAD_DIM: cutlass.Constexpr[int],
 ):
@@ -572,16 +587,12 @@ def gated_delta_rule_decode_kernel_seqlen1(
 
     smem = utils.SmemAllocator()
 
-    # Compute gates using shared helper
-    alpha = ga[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    beta_raw = gb[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    A_log_val = gA_log[value_head_idx]
-    dt_bias_val = gdt_bias[value_head_idx]
-    g_exp, beta = compute_single_gate(
-        alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
+    # Load pre-computed gate and beta from global memory
+    g_head = gG[(batch_idx, 0, value_head_idx, None)]  # [K=HEAD_DIM]
+    beta = gBeta[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
 
     # Allocate SMEM — always 4 H chunk buffers for simplicity
+    # (unused ones waste ~4.5KB for HEAD_DIM=64, trivial vs SM100's 228KB)
     h_sh_chunk0 = smem.allocate_tensor(
         cutlass.BFloat16,
         cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
@@ -607,10 +618,10 @@ def gated_delta_rule_decode_kernel_seqlen1(
     k_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
 
     pred_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
+        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
     )
     out_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
+        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
     )
 
     h_global = gH[(batch_idx, value_head_idx, None, None)]
@@ -646,6 +657,9 @@ def gated_delta_rule_decode_kernel_seqlen1(
     k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)  # PERSISTENT K!
     qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
 
+    # Transient per-K gate array (recomputed per V-chunk)
+    g_exp_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
+
     k_base = warp_idx * 32
 
     # Load K ONCE - keep for entire kernel
@@ -661,6 +675,9 @@ def gated_delta_rule_decode_kernel_seqlen1(
     nvvm.cp_async_wait_group(1)
     cute.arch.sync_threads()
 
+    # Load pre-computed per-K gate (same for all V-chunks since T=1)
+    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
+
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, 32, 2):
@@ -669,7 +686,421 @@ def gated_delta_rule_decode_kernel_seqlen1(
                 h_sh_chunk0[lane_idx, k_base + i].to(cutlass.Float32),
                 h_sh_chunk0[lane_idx, k_base + i + 1].to(cutlass.Float32),
             ),
-            src_b=(g_exp, g_exp),
+            src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
+            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        )
+    for i in cutlass.range_constexpr(0, 32, 2):
+        pred, pred2 = cute.arch.fma_packed_f32x2(
+            src_a=(h_chunk[i], h_chunk[i + 1]),
+            src_b=(k_chunk[i], k_chunk[i + 1]),
+            src_c=(pred, pred2),
+        )
+    pred = pred + pred2
+
+    pred_sh[warp_idx, lane_idx] = pred
+    cute.arch.sync_threads()
+    pred_final = cutlass.Float32(0.0)
+    if HEAD_DIM == 64:
+        pred_final = pred_sh[0, lane_idx] + pred_sh[1, lane_idx]
+    elif HEAD_DIM == 128:
+        pred_final = (
+            pred_sh[0, lane_idx]
+            + pred_sh[1, lane_idx]
+            + pred_sh[2, lane_idx]
+            + pred_sh[3, lane_idx]
+        )
+
+    v_val = (v_sh[lane_idx] - pred_final) * beta
+
+    for i in cutlass.range_constexpr(0, 32, 2):
+        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+            src_a=(k_chunk[i], k_chunk[i + 1]),
+            src_b=(v_val, v_val),
+            src_c=(h_chunk[i], h_chunk[i + 1]),
+        )
+
+    # Load Q for output computation
+    for i in cutlass.range_constexpr(32):
+        qk_temp[i] = q_sh[k_base + i]
+
+    out = cutlass.Float32(0.0)
+    out2 = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(0, 32, 2):
+        out, out2 = cute.arch.fma_packed_f32x2(
+            src_a=(h_chunk[i], h_chunk[i + 1]),
+            src_b=(qk_temp[i], qk_temp[i + 1]),
+            src_c=(out, out2),
+        )
+    out = out + out2
+
+    out_sh[warp_idx, lane_idx] = out
+    cute.arch.sync_threads()
+    out_final = cutlass.Float32(0.0)
+    if HEAD_DIM == 64:
+        out_final = out_sh[0, lane_idx] + out_sh[1, lane_idx]
+    elif HEAD_DIM == 128:
+        out_final = (
+            out_sh[0, lane_idx]
+            + out_sh[1, lane_idx]
+            + out_sh[2, lane_idx]
+            + out_sh[3, lane_idx]
+        )
+
+    write_h_chunk_to_smem(h_chunk, h_sh_chunk0, lane_idx, k_base)
+    if warp_idx == 0:
+        o_head[lane_idx] = out_final.to(cutlass.BFloat16)
+
+    # ========================================================================
+    # CHUNK 1
+    # ========================================================================
+    nvvm.cp_async_wait_group(0)
+    cute.arch.sync_threads()
+
+    if HEAD_DIM == 128:
+        load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64, HEAD_DIM)
+        nvvm.cp_async_commit_group()
+        load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96, HEAD_DIM)
+        nvvm.cp_async_commit_group()
+
+    store_h_smem_to_gmem(h_sh_chunk0, h_out, tidx, 0, HEAD_DIM)
+
+    pred = cutlass.Float32(0.0)
+    pred2 = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(0, 32, 2):
+        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+            src_a=(
+                h_sh_chunk1[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk1[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            ),
+            src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
+            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        )
+    for i in cutlass.range_constexpr(0, 32, 2):
+        pred, pred2 = cute.arch.fma_packed_f32x2(
+            src_a=(h_chunk[i], h_chunk[i + 1]),
+            src_b=(k_chunk[i], k_chunk[i + 1]),
+            src_c=(pred, pred2),
+        )
+    pred = pred + pred2
+
+    pred_sh[warp_idx, lane_idx] = pred
+    cute.arch.sync_threads()
+    pred_final = cutlass.Float32(0.0)
+    if HEAD_DIM == 64:
+        pred_final = pred_sh[0, lane_idx] + pred_sh[1, lane_idx]
+    elif HEAD_DIM == 128:
+        pred_final = (
+            pred_sh[0, lane_idx]
+            + pred_sh[1, lane_idx]
+            + pred_sh[2, lane_idx]
+            + pred_sh[3, lane_idx]
+        )
+
+    v_val = (v_sh[32 + lane_idx] - pred_final) * beta
+
+    for i in cutlass.range_constexpr(0, 32, 2):
+        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+            src_a=(k_chunk[i], k_chunk[i + 1]),
+            src_b=(v_val, v_val),
+            src_c=(h_chunk[i], h_chunk[i + 1]),
+        )
+
+    for i in cutlass.range_constexpr(32):
+        qk_temp[i] = q_sh[k_base + i]
+
+    out = cutlass.Float32(0.0)
+    out2 = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(0, 32, 2):
+        out, out2 = cute.arch.fma_packed_f32x2(
+            src_a=(h_chunk[i], h_chunk[i + 1]),
+            src_b=(qk_temp[i], qk_temp[i + 1]),
+            src_c=(out, out2),
+        )
+    out = out + out2
+
+    out_sh[warp_idx, lane_idx] = out
+    cute.arch.sync_threads()
+    out_final = cutlass.Float32(0.0)
+    if HEAD_DIM == 64:
+        out_final = out_sh[0, lane_idx] + out_sh[1, lane_idx]
+    elif HEAD_DIM == 128:
+        out_final = (
+            out_sh[0, lane_idx]
+            + out_sh[1, lane_idx]
+            + out_sh[2, lane_idx]
+            + out_sh[3, lane_idx]
+        )
+
+    write_h_chunk_to_smem(h_chunk, h_sh_chunk1, lane_idx, k_base)
+    if warp_idx == 0:
+        o_head[32 + lane_idx] = out_final.to(cutlass.BFloat16)
+
+    # For HEAD_DIM=64: done after 2 chunks. Store chunk1 H and return.
+    if HEAD_DIM == 64:
+        cute.arch.sync_threads()
+        store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32, HEAD_DIM)
+
+    # ========================================================================
+    # CHUNK 2 (HEAD_DIM=128 only)
+    # ========================================================================
+    if HEAD_DIM == 128:
+        nvvm.cp_async_wait_group(1)
+        cute.arch.sync_threads()
+
+        store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32, HEAD_DIM)
+
+        pred = cutlass.Float32(0.0)
+        pred2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+                src_a=(
+                    h_sh_chunk2[lane_idx, k_base + i].to(cutlass.Float32),
+                    h_sh_chunk2[lane_idx, k_base + i + 1].to(cutlass.Float32),
+                ),
+                src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
+                src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+            )
+        for i in cutlass.range_constexpr(0, 32, 2):
+            pred, pred2 = cute.arch.fma_packed_f32x2(
+                src_a=(h_chunk[i], h_chunk[i + 1]),
+                src_b=(k_chunk[i], k_chunk[i + 1]),
+                src_c=(pred, pred2),
+            )
+        pred = pred + pred2
+
+        pred_sh[warp_idx, lane_idx] = pred
+        cute.arch.sync_threads()
+        pred_final = (
+            pred_sh[0, lane_idx]
+            + pred_sh[1, lane_idx]
+            + pred_sh[2, lane_idx]
+            + pred_sh[3, lane_idx]
+        )
+
+        v_val = (v_sh[64 + lane_idx] - pred_final) * beta
+
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+                src_a=(k_chunk[i], k_chunk[i + 1]),
+                src_b=(v_val, v_val),
+                src_c=(h_chunk[i], h_chunk[i + 1]),
+            )
+
+        for i in cutlass.range_constexpr(32):
+            qk_temp[i] = q_sh[k_base + i]
+
+        out = cutlass.Float32(0.0)
+        out2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            out, out2 = cute.arch.fma_packed_f32x2(
+                src_a=(h_chunk[i], h_chunk[i + 1]),
+                src_b=(qk_temp[i], qk_temp[i + 1]),
+                src_c=(out, out2),
+            )
+        out = out + out2
+
+        out_sh[warp_idx, lane_idx] = out
+        cute.arch.sync_threads()
+        out_final = (
+            out_sh[0, lane_idx]
+            + out_sh[1, lane_idx]
+            + out_sh[2, lane_idx]
+            + out_sh[3, lane_idx]
+        )
+
+        write_h_chunk_to_smem(h_chunk, h_sh_chunk2, lane_idx, k_base)
+        if warp_idx == 0:
+            o_head[64 + lane_idx] = out_final.to(cutlass.BFloat16)
+
+        # ====================================================================
+        # CHUNK 3 (HEAD_DIM=128 only)
+        # ====================================================================
+        nvvm.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        store_h_smem_to_gmem(h_sh_chunk2, h_out, tidx, 64, HEAD_DIM)
+
+        pred = cutlass.Float32(0.0)
+        pred2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+                src_a=(
+                    h_sh_chunk3[lane_idx, k_base + i].to(cutlass.Float32),
+                    h_sh_chunk3[lane_idx, k_base + i + 1].to(cutlass.Float32),
+                ),
+                src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
+                src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+            )
+        for i in cutlass.range_constexpr(0, 32, 2):
+            pred, pred2 = cute.arch.fma_packed_f32x2(
+                src_a=(h_chunk[i], h_chunk[i + 1]),
+                src_b=(k_chunk[i], k_chunk[i + 1]),
+                src_c=(pred, pred2),
+            )
+        pred = pred + pred2
+
+        pred_sh[warp_idx, lane_idx] = pred
+        cute.arch.sync_threads()
+        pred_final = (
+            pred_sh[0, lane_idx]
+            + pred_sh[1, lane_idx]
+            + pred_sh[2, lane_idx]
+            + pred_sh[3, lane_idx]
+        )
+
+        v_val = (v_sh[96 + lane_idx] - pred_final) * beta
+
+        for i in cutlass.range_constexpr(0, 32, 2):
+            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+                src_a=(k_chunk[i], k_chunk[i + 1]),
+                src_b=(v_val, v_val),
+                src_c=(h_chunk[i], h_chunk[i + 1]),
+            )
+
+        for i in cutlass.range_constexpr(32):
+            qk_temp[i] = q_sh[k_base + i]
+
+        out = cutlass.Float32(0.0)
+        out2 = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(0, 32, 2):
+            out, out2 = cute.arch.fma_packed_f32x2(
+                src_a=(h_chunk[i], h_chunk[i + 1]),
+                src_b=(qk_temp[i], qk_temp[i + 1]),
+                src_c=(out, out2),
+            )
+        out = out + out2
+
+        out_sh[warp_idx, lane_idx] = out
+        cute.arch.sync_threads()
+        out_final = (
+            out_sh[0, lane_idx]
+            + out_sh[1, lane_idx]
+            + out_sh[2, lane_idx]
+            + out_sh[3, lane_idx]
+        )
+
+        write_h_chunk_to_smem(h_chunk, h_sh_chunk3, lane_idx, k_base)
+        if warp_idx == 0:
+            o_head[96 + lane_idx] = out_final.to(cutlass.BFloat16)
+
+        cute.arch.sync_threads()
+        store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96, HEAD_DIM)
+
+
+# ==============================================================================
+# SEQLEN=1 LOW-BATCH-SIZE KERNEL (1 V-chunk per CTA)
+# ==============================================================================
+
+
+@cute.kernel
+def kda_gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
+    gQ: cute.Tensor,
+    gK: cute.Tensor,
+    gV: cute.Tensor,
+    gG: cute.Tensor,  # [B, T, HV, K] log-space gate
+    gBeta: cute.Tensor,  # [B, T, HV] pre-sigmoided
+    gH: cute.Tensor,
+    gO: cute.Tensor,
+    scale: cutlass.Float32,
+    eps: cutlass.Float32,
+    HEAD_DIM: cutlass.Constexpr[int],
+):
+    """
+    Seqlen=1 kernel with 1 V-chunk (32 V rows) per CTA.
+    For T=1, batch_size <= 4: more CTAs per batch*head for better SM utilization.
+    Grid: batch_idx * HV * NUM_V_CHUNKS + value_head_idx * NUM_V_CHUNKS + v_chunk_idx.
+    HEAD_DIM: 64 or 128 (compile-time). NUM_V_CHUNKS = HEAD_DIM // 32.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    HV = cutlass.Int32(gV.shape[2])
+    H = cutlass.Int32(gQ.shape[2])
+
+    batch_idx = bidx // (HV * (HEAD_DIM // 32))
+    remainder = bidx % (HV * (HEAD_DIM // 32))
+    value_head_idx = remainder // (HEAD_DIM // 32)
+    v_chunk_idx = remainder % (HEAD_DIM // 32)
+
+    query_head_idx = value_head_idx // (HV // H)
+    v_row_base = v_chunk_idx * 32
+
+    smem = utils.SmemAllocator()
+
+    # Load pre-computed gate and beta from global memory
+    g_head = gG[(batch_idx, 0, value_head_idx, None)]  # [K=HEAD_DIM]
+    beta = gBeta[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
+
+    h_sh_chunk = smem.allocate_tensor(
+        cutlass.BFloat16,
+        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        byte_alignment=128,
+    )
+
+    q_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
+    k_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
+
+    # Transposed layout for 1-chunk reduction: [lane_idx, warp_idx]
+    pred_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
+    )
+    out_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
+    )
+
+    h_global = gH[(batch_idx, value_head_idx, None, None)]
+
+    load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base, HEAD_DIM)
+    nvvm.cp_async_commit_group()
+
+    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
+    k_head = gK[(batch_idx, 0, query_head_idx, None)]
+
+    warp_idx = tidx // 32
+    lane_idx = tidx % 32
+
+    if warp_idx == 0:
+        normalize_and_store_qk_to_smem(
+            q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM
+        )
+
+    cute.arch.sync_threads()
+
+    v_head = gV[(batch_idx, 0, value_head_idx, None)]
+    v_sh = smem.allocate_tensor(cutlass.Float32, 32)
+    if tidx < 32:
+        v_sh[tidx] = v_head[v_row_base + tidx].to(cutlass.Float32)
+
+    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
+    k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)  # PERSISTENT K!
+    qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
+
+    # Per-K gate array
+    g_exp_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
+
+    k_base = warp_idx * 32
+
+    for i in cutlass.range_constexpr(32):
+        k_chunk[i] = k_sh[k_base + i]
+
+    h_out = gH[(batch_idx, value_head_idx, None, None)]
+    o_head = gO[(batch_idx, 0, value_head_idx, None)]
+
+    nvvm.cp_async_wait_group(0)
+    cute.arch.sync_threads()
+
+    # Load pre-computed per-K gate vector from global memory
+    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
+
+    pred = cutlass.Float32(0.0)
+    pred2 = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(0, 32, 2):
+        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+            src_a=(
+                h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            ),
+            src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
             src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
         )
     for i in cutlass.range_constexpr(0, 32, 2):
@@ -702,7 +1133,6 @@ def gated_delta_rule_decode_kernel_seqlen1(
             src_c=(h_chunk[i], h_chunk[i + 1]),
         )
 
-    # Load Q for output computation
     for i in cutlass.range_constexpr(32):
         qk_temp[i] = q_sh[k_base + i]
 
@@ -729,245 +1159,12 @@ def gated_delta_rule_decode_kernel_seqlen1(
             + out_sh[lane_idx, 3]
         )
 
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk0, lane_idx, k_base)
+    write_h_chunk_to_smem(h_chunk, h_sh_chunk, lane_idx, k_base)
     if warp_idx == 0:
-        o_head[lane_idx] = out_final.to(cutlass.BFloat16)
+        o_head[v_row_base + lane_idx] = out_final.to(cutlass.BFloat16)
 
-    # ========================================================================
-    # CHUNK 1
-    # ========================================================================
-    nvvm.cp_async_wait_group(0)
     cute.arch.sync_threads()
-
-    if HEAD_DIM == 128:
-        load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64, HEAD_DIM)
-        nvvm.cp_async_commit_group()
-        load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96, HEAD_DIM)
-        nvvm.cp_async_commit_group()
-
-    store_h_smem_to_gmem(h_sh_chunk0, h_out, tidx, 0, HEAD_DIM)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk1[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk1[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = cutlass.Float32(0.0)
-    if HEAD_DIM == 64:
-        pred_final = pred_sh[lane_idx, 0] + pred_sh[lane_idx, 1]
-    elif HEAD_DIM == 128:
-        pred_final = (
-            pred_sh[lane_idx, 0]
-            + pred_sh[lane_idx, 1]
-            + pred_sh[lane_idx, 2]
-            + pred_sh[lane_idx, 3]
-        )
-
-    v_val = (v_sh[32 + lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = cutlass.Float32(0.0)
-    if HEAD_DIM == 64:
-        out_final = out_sh[lane_idx, 0] + out_sh[lane_idx, 1]
-    elif HEAD_DIM == 128:
-        out_final = (
-            out_sh[lane_idx, 0]
-            + out_sh[lane_idx, 1]
-            + out_sh[lane_idx, 2]
-            + out_sh[lane_idx, 3]
-        )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk1, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[32 + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    # For HEAD_DIM=64: done after 2 chunks. Store chunk1 H and return.
-    if HEAD_DIM == 64:
-        cute.arch.sync_threads()
-        store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32, HEAD_DIM)
-
-    # ========================================================================
-    # CHUNK 2 (HEAD_DIM=128 only)
-    # ========================================================================
-    if HEAD_DIM == 128:
-        nvvm.cp_async_wait_group(1)
-        cute.arch.sync_threads()
-
-        store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32, HEAD_DIM)
-
-        pred = cutlass.Float32(0.0)
-        pred2 = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(0, 32, 2):
-            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-                src_a=(
-                    h_sh_chunk2[lane_idx, k_base + i].to(cutlass.Float32),
-                    h_sh_chunk2[lane_idx, k_base + i + 1].to(cutlass.Float32),
-                ),
-                src_b=(g_exp, g_exp),
-                src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-            )
-        for i in cutlass.range_constexpr(0, 32, 2):
-            pred, pred2 = cute.arch.fma_packed_f32x2(
-                src_a=(h_chunk[i], h_chunk[i + 1]),
-                src_b=(k_chunk[i], k_chunk[i + 1]),
-                src_c=(pred, pred2),
-            )
-        pred = pred + pred2
-
-        pred_sh[lane_idx, warp_idx] = pred
-        cute.arch.sync_threads()
-        pred_final = (
-            pred_sh[lane_idx, 0]
-            + pred_sh[lane_idx, 1]
-            + pred_sh[lane_idx, 2]
-            + pred_sh[lane_idx, 3]
-        )
-
-        v_val = (v_sh[64 + lane_idx] - pred_final) * beta
-
-        for i in cutlass.range_constexpr(0, 32, 2):
-            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-                src_a=(k_chunk[i], k_chunk[i + 1]),
-                src_b=(v_val, v_val),
-                src_c=(h_chunk[i], h_chunk[i + 1]),
-            )
-
-        for i in cutlass.range_constexpr(32):
-            qk_temp[i] = q_sh[k_base + i]
-
-        out = cutlass.Float32(0.0)
-        out2 = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(0, 32, 2):
-            out, out2 = cute.arch.fma_packed_f32x2(
-                src_a=(h_chunk[i], h_chunk[i + 1]),
-                src_b=(qk_temp[i], qk_temp[i + 1]),
-                src_c=(out, out2),
-            )
-        out = out + out2
-
-        out_sh[lane_idx, warp_idx] = out
-        cute.arch.sync_threads()
-        out_final = (
-            out_sh[lane_idx, 0]
-            + out_sh[lane_idx, 1]
-            + out_sh[lane_idx, 2]
-            + out_sh[lane_idx, 3]
-        )
-
-        write_h_chunk_to_smem(h_chunk, h_sh_chunk2, lane_idx, k_base)
-        if warp_idx == 0:
-            o_head[64 + lane_idx] = out_final.to(cutlass.BFloat16)
-
-        # ====================================================================
-        # CHUNK 3 (HEAD_DIM=128 only)
-        # ====================================================================
-        nvvm.cp_async_wait_group(0)
-        cute.arch.sync_threads()
-
-        store_h_smem_to_gmem(h_sh_chunk2, h_out, tidx, 64, HEAD_DIM)
-
-        pred = cutlass.Float32(0.0)
-        pred2 = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(0, 32, 2):
-            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-                src_a=(
-                    h_sh_chunk3[lane_idx, k_base + i].to(cutlass.Float32),
-                    h_sh_chunk3[lane_idx, k_base + i + 1].to(cutlass.Float32),
-                ),
-                src_b=(g_exp, g_exp),
-                src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-            )
-        for i in cutlass.range_constexpr(0, 32, 2):
-            pred, pred2 = cute.arch.fma_packed_f32x2(
-                src_a=(h_chunk[i], h_chunk[i + 1]),
-                src_b=(k_chunk[i], k_chunk[i + 1]),
-                src_c=(pred, pred2),
-            )
-        pred = pred + pred2
-
-        pred_sh[lane_idx, warp_idx] = pred
-        cute.arch.sync_threads()
-        pred_final = (
-            pred_sh[lane_idx, 0]
-            + pred_sh[lane_idx, 1]
-            + pred_sh[lane_idx, 2]
-            + pred_sh[lane_idx, 3]
-        )
-
-        v_val = (v_sh[96 + lane_idx] - pred_final) * beta
-
-        for i in cutlass.range_constexpr(0, 32, 2):
-            h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-                src_a=(k_chunk[i], k_chunk[i + 1]),
-                src_b=(v_val, v_val),
-                src_c=(h_chunk[i], h_chunk[i + 1]),
-            )
-
-        for i in cutlass.range_constexpr(32):
-            qk_temp[i] = q_sh[k_base + i]
-
-        out = cutlass.Float32(0.0)
-        out2 = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(0, 32, 2):
-            out, out2 = cute.arch.fma_packed_f32x2(
-                src_a=(h_chunk[i], h_chunk[i + 1]),
-                src_b=(qk_temp[i], qk_temp[i + 1]),
-                src_c=(out, out2),
-            )
-        out = out + out2
-
-        out_sh[lane_idx, warp_idx] = out
-        cute.arch.sync_threads()
-        out_final = (
-            out_sh[lane_idx, 0]
-            + out_sh[lane_idx, 1]
-            + out_sh[lane_idx, 2]
-            + out_sh[lane_idx, 3]
-        )
-
-        write_h_chunk_to_smem(h_chunk, h_sh_chunk3, lane_idx, k_base)
-        if warp_idx == 0:
-            o_head[96 + lane_idx] = out_final.to(cutlass.BFloat16)
-
-        cute.arch.sync_threads()
-        store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96, HEAD_DIM)
+    store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_base, HEAD_DIM)
 
 
 # ==============================================================================
@@ -980,15 +1177,11 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     gQ: cute.Tensor,  # [B, T=2/3/4, H, K]
     gK: cute.Tensor,  # [B, T=2/3/4, H, K]
     gV: cute.Tensor,  # [B, T=2/3/4, HV, V]
-    ga: cute.Tensor,  # [B, T=2/3/4, HV]
-    gb: cute.Tensor,  # [B, T=2/3/4, HV]
-    gA_log: cute.Tensor,  # [HV]
-    gdt_bias: cute.Tensor,  # [HV]
+    gG: cute.Tensor,  # [B, T=2/3/4, HV, K] log-space gate
+    gBeta: cute.Tensor,  # [B, T=2/3/4, HV] pre-sigmoided
     gH: cute.Tensor,  # [B, HV, V, K] - K-fast layout
     gO: cute.Tensor,  # [B, T=2/3/4, HV, V]
     scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
     eps: cutlass.Float32,
     NUM_TOKENS: cutlass.Constexpr[int],  # 2, 3, or 4
     HEAD_DIM: cutlass.Constexpr[int],  # 64 or 128
@@ -1069,41 +1262,26 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
     h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
     kq_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
 
-    # Gate computation - always compute gates 0, 1 (for T>=2)
-    A_log_val = gA_log[value_head_idx]
-    dt_bias_val = gdt_bias[value_head_idx]
+    # Transient per-K gate registers (recomputed per token per V-chunk)
+    g_exp_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
 
-    alpha0 = ga[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    beta_raw0 = gb[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    g_exp0, beta0 = compute_single_gate(
-        alpha0, beta_raw0, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
+    # Load gate slices for each token from global memory
+    g_head0 = gG[(batch_idx, 0, value_head_idx, None)]  # [K=HEAD_DIM]
+    g_head1 = gG[(batch_idx, 1, value_head_idx, None)]  # [K=HEAD_DIM]
+    beta0 = gBeta[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
+    beta1 = gBeta[(batch_idx, 1, value_head_idx)].to(cutlass.Float32)
 
-    alpha1 = ga[(batch_idx, 1, value_head_idx)].to(cutlass.Float32)
-    beta_raw1 = gb[(batch_idx, 1, value_head_idx)].to(cutlass.Float32)
-    g_exp1, beta1 = compute_single_gate(
-        alpha1, beta_raw1, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
-
-    # Gate 2 - only for NUM_TOKENS >= 3
-    g_exp2 = cutlass.Float32(0.0)
+    g_head2 = g_head0  # default for T=2
     beta2 = cutlass.Float32(0.0)
     if NUM_TOKENS >= 3:
-        alpha2 = ga[(batch_idx, 2, value_head_idx)].to(cutlass.Float32)
-        beta_raw2 = gb[(batch_idx, 2, value_head_idx)].to(cutlass.Float32)
-        g_exp2, beta2 = compute_single_gate(
-            alpha2, beta_raw2, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-        )
+        g_head2 = gG[(batch_idx, 2, value_head_idx, None)]
+        beta2 = gBeta[(batch_idx, 2, value_head_idx)].to(cutlass.Float32)
 
-    # Gate 3 - only for NUM_TOKENS = 4
-    g_exp3 = cutlass.Float32(0.0)
+    g_head3 = g_head0  # default for T=2,3
     beta3 = cutlass.Float32(0.0)
     if NUM_TOKENS == 4:
-        alpha3 = ga[(batch_idx, 3, value_head_idx)].to(cutlass.Float32)
-        beta_raw3 = gb[(batch_idx, 3, value_head_idx)].to(cutlass.Float32)
-        g_exp3, beta3 = compute_single_gate(
-            alpha3, beta_raw3, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-        )
+        g_head3 = gG[(batch_idx, 3, value_head_idx, None)]
+        beta3 = gBeta[(batch_idx, 3, value_head_idx)].to(cutlass.Float32)
 
     # Upfront H loading — load all NUM_V_CHUNKS
     h_global = gH[(batch_idx, value_head_idx, None, None)]
@@ -1118,6 +1296,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
         nvvm.cp_async_commit_group()
 
     # Q/K normalization
+    # With NUM_WARPS=HEAD_DIM//32 warps, assign one warp per token for the first round
     q_head0 = gQ[(batch_idx, 0, query_head_idx, None)]
     k_head0 = gK[(batch_idx, 0, query_head_idx, None)]
     q_head1 = gQ[(batch_idx, 1, query_head_idx, None)]
@@ -1215,6 +1394,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
         h_out,
         h_chunk,
         kq_chunk,
+        g_exp_chunk,
         k_sh0,
         k_sh1,
         k_sh2,
@@ -1232,10 +1412,10 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
         o_head1,
         o_head2,
         o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
+        g_head0,
+        g_head1,
+        g_head2,
+        g_head3,
         beta0,
         beta1,
         beta2,
@@ -1263,6 +1443,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
         h_out,
         h_chunk,
         kq_chunk,
+        g_exp_chunk,
         k_sh0,
         k_sh1,
         k_sh2,
@@ -1280,10 +1461,10 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
         o_head1,
         o_head2,
         o_head3,
-        g_exp0,
-        g_exp1,
-        g_exp2,
-        g_exp3,
+        g_head0,
+        g_head1,
+        g_head2,
+        g_head3,
         beta0,
         beta1,
         beta2,
@@ -1314,6 +1495,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
             h_out,
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh0,
             k_sh1,
             k_sh2,
@@ -1331,10 +1513,10 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
             o_head1,
             o_head2,
             o_head3,
-            g_exp0,
-            g_exp1,
-            g_exp2,
-            g_exp3,
+            g_head0,
+            g_head1,
+            g_head2,
+            g_head3,
             beta0,
             beta1,
             beta2,
@@ -1359,6 +1541,7 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
             h_out,
             h_chunk,
             kq_chunk,
+            g_exp_chunk,
             k_sh0,
             k_sh1,
             k_sh2,
@@ -1376,10 +1559,10 @@ def gated_delta_rule_decode_kernel_seqlen234_unified(
             o_head1,
             o_head2,
             o_head3,
-            g_exp0,
-            g_exp1,
-            g_exp2,
-            g_exp3,
+            g_head0,
+            g_head1,
+            g_head2,
+            g_head3,
             beta0,
             beta1,
             beta2,
@@ -1410,15 +1593,11 @@ def gated_delta_rule_launch_seqlen1(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
+    mG: cute.Tensor,
+    mBeta: cute.Tensor,
     mH: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
     eps: cutlass.Float32,
     stream: cuda.CUstream,
     HEAD_DIM: cutlass.Constexpr[int],
@@ -1430,15 +1609,11 @@ def gated_delta_rule_launch_seqlen1(
         mQ,
         mK,
         mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
+        mG,
+        mBeta,
         mH,
         mO,
         scale,
-        softplus_beta,
-        softplus_threshold,
         eps,
         HEAD_DIM,
     ).launch(
@@ -1448,201 +1623,16 @@ def gated_delta_rule_launch_seqlen1(
     )
 
 
-# ==============================================================================
-# LOW-BS SEQLEN=1 KERNEL - 1 V-CHUNK PER CTA (T=1, BS<=4)
-# ==============================================================================
-
-
-@cute.kernel
-def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
-    gQ: cute.Tensor,
-    gK: cute.Tensor,
-    gV: cute.Tensor,
-    ga: cute.Tensor,
-    gb: cute.Tensor,
-    gA_log: cute.Tensor,
-    gdt_bias: cute.Tensor,
-    gH: cute.Tensor,
-    gO: cute.Tensor,
-    scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
-    eps: cutlass.Float32,
-    HEAD_DIM: cutlass.Constexpr[int],
-):
-    """
-    Seqlen=1 kernel with 1 V-chunk (32 V rows) per CTA.
-    For T=1, batch_size <= 4: more CTAs per batch*head for better SM utilization.
-    Grid: batch_idx * HV * NUM_V_CHUNKS + value_head_idx * NUM_V_CHUNKS + v_chunk_idx.
-    HEAD_DIM: 64 or 128 (compile-time). NUM_V_CHUNKS = HEAD_DIM // 32.
-    """
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
-
-    batch_idx = bidx // (HV * (HEAD_DIM // 32))
-    remainder = bidx % (HV * (HEAD_DIM // 32))
-    value_head_idx = remainder // (HEAD_DIM // 32)
-    v_chunk_idx = remainder % (HEAD_DIM // 32)
-
-    query_head_idx = value_head_idx // (HV // H)
-    v_row_base = v_chunk_idx * 32
-
-    smem = utils.SmemAllocator()
-
-    alpha = ga[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    beta_raw = gb[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    A_log_val = gA_log[value_head_idx]
-    dt_bias_val = gdt_bias[value_head_idx]
-    g_exp, beta = compute_single_gate(
-        alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
-    )
-
-    h_sh_chunk = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
-        byte_alignment=128,
-    )
-
-    q_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    k_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-
-    pred_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
-    )
-    out_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
-    )
-
-    h_global = gH[(batch_idx, value_head_idx, None, None)]
-
-    load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base, HEAD_DIM)
-    nvvm.cp_async_commit_group()
-
-    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head = gK[(batch_idx, 0, query_head_idx, None)]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(
-            q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM
-        )
-
-    cute.arch.sync_threads()
-
-    v_head = gV[(batch_idx, 0, value_head_idx, None)]
-    v_sh = smem.allocate_tensor(cutlass.Float32, 32)
-    if tidx < 32:
-        v_sh[tidx] = v_head[v_row_base + tidx].to(cutlass.Float32)
-
-    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-    k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)  # PERSISTENT K!
-    qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    k_base = warp_idx * 32
-
-    for i in cutlass.range_constexpr(32):
-        k_chunk[i] = k_sh[k_base + i]
-
-    h_out = gH[(batch_idx, value_head_idx, None, None)]
-    o_head = gO[(batch_idx, 0, value_head_idx, None)]
-
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp, g_exp),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = cutlass.Float32(0.0)
-    if HEAD_DIM == 64:
-        pred_final = pred_sh[lane_idx, 0] + pred_sh[lane_idx, 1]
-    elif HEAD_DIM == 128:
-        pred_final = (
-            pred_sh[lane_idx, 0]
-            + pred_sh[lane_idx, 1]
-            + pred_sh[lane_idx, 2]
-            + pred_sh[lane_idx, 3]
-        )
-
-    v_val = (v_sh[lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = cutlass.Float32(0.0)
-    if HEAD_DIM == 64:
-        out_final = out_sh[lane_idx, 0] + out_sh[lane_idx, 1]
-    elif HEAD_DIM == 128:
-        out_final = (
-            out_sh[lane_idx, 0]
-            + out_sh[lane_idx, 1]
-            + out_sh[lane_idx, 2]
-            + out_sh[lane_idx, 3]
-        )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[v_row_base + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_base, HEAD_DIM)
-
-
 @cute.jit
 def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
+    mG: cute.Tensor,
+    mBeta: cute.Tensor,
     mH: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
     eps: cutlass.Float32,
     stream: cuda.CUstream,
     HEAD_DIM: cutlass.Constexpr[int],
@@ -1651,19 +1641,15 @@ def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
     batch_size = mQ.shape[0]
     HV = mV.shape[2]
 
-    gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
+    kda_gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
         mQ,
         mK,
         mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
+        mG,
+        mBeta,
         mH,
         mO,
         scale,
-        softplus_beta,
-        softplus_threshold,
         eps,
         HEAD_DIM,
     ).launch(
@@ -1678,15 +1664,11 @@ def gated_delta_rule_launch_seqlen2(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
+    mG: cute.Tensor,
+    mBeta: cute.Tensor,
     mH: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
     eps: cutlass.Float32,
     stream: cuda.CUstream,
     HEAD_DIM: cutlass.Constexpr[int],
@@ -1698,15 +1680,11 @@ def gated_delta_rule_launch_seqlen2(
         mQ,
         mK,
         mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
+        mG,
+        mBeta,
         mH,
         mO,
         scale,
-        softplus_beta,
-        softplus_threshold,
         eps,
         2,  # NUM_TOKENS=2
         HEAD_DIM,
@@ -1722,15 +1700,11 @@ def gated_delta_rule_launch_seqlen3(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
+    mG: cute.Tensor,
+    mBeta: cute.Tensor,
     mH: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
     eps: cutlass.Float32,
     stream: cuda.CUstream,
     HEAD_DIM: cutlass.Constexpr[int],
@@ -1742,15 +1716,11 @@ def gated_delta_rule_launch_seqlen3(
         mQ,
         mK,
         mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
+        mG,
+        mBeta,
         mH,
         mO,
         scale,
-        softplus_beta,
-        softplus_threshold,
         eps,
         3,  # NUM_TOKENS=3
         HEAD_DIM,
@@ -1766,15 +1736,11 @@ def gated_delta_rule_launch_seqlen4(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mV: cute.Tensor,
-    ma: cute.Tensor,
-    mb: cute.Tensor,
-    mA_log: cute.Tensor,
-    mdt_bias: cute.Tensor,
+    mG: cute.Tensor,
+    mBeta: cute.Tensor,
     mH: cute.Tensor,
     mO: cute.Tensor,
     scale: cutlass.Float32,
-    softplus_beta: cutlass.Float32,
-    softplus_threshold: cutlass.Float32,
     eps: cutlass.Float32,
     stream: cuda.CUstream,
     HEAD_DIM: cutlass.Constexpr[int],
@@ -1786,15 +1752,11 @@ def gated_delta_rule_launch_seqlen4(
         mQ,
         mK,
         mV,
-        ma,
-        mb,
-        mA_log,
-        mdt_bias,
+        mG,
+        mBeta,
         mH,
         mO,
         scale,
-        softplus_beta,
-        softplus_threshold,
         eps,
         4,  # NUM_TOKENS=4
         HEAD_DIM,
@@ -1841,93 +1803,124 @@ class GatedDeltaRuleKernel:
 # PUBLIC API
 # ==============================================================================
 
-_compiled_kernels = {}  # Cache: (T, HEAD_DIM, B) -> compiled kernel
+# ==============================================================================
+# TVM FFI COMPILATION (zero DLPack overhead)
+# ==============================================================================
+
+_tvm_kernels = {}  # Cache: (T, HEAD_DIM) -> compiled TVM FFI kernel
 
 
-def gated_delta_rule(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    softplus_beta: float = 1.0,
-    softplus_threshold: float = 20.0,
-    q: Optional[torch.Tensor] = None,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    b: Optional[torch.Tensor] = None,
-    initial_state_source: Optional[torch.Tensor] = None,
-    initial_state_indices: Optional[torch.Tensor] = None,
-    use_qk_l2norm_in_kernel: bool = True,
+def _compile_tvm_ffi(T, launch_fn, HEAD_DIM):
+    """Compile kernel with fake tensors and symbolic dims for TVM FFI dispatch.
+
+    Uses cute.sym_int() for B, H, HV so we compile once per (T, HEAD_DIM).
+    At runtime, torch.Tensor objects are passed directly — no from_dlpack() needed.
+    """
+    B_sym = cute.sym_int()
+    H_sym = cute.sym_int()
+    HV_sym = cute.sym_int()
+    K, V = HEAD_DIM, HEAD_DIM
+
+    def make_fake(shape, dtype=cute.BFloat16):
+        ndim = len(shape)
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            shape,
+            assumed_align=32,
+            stride_order=tuple(reversed(range(ndim))),  # row-major
+        )
+
+    q_fake = make_fake((B_sym, T, H_sym, K))
+    k_fake = make_fake((B_sym, T, H_sym, K))
+    v_fake = make_fake((B_sym, T, HV_sym, V))
+    g_fake = make_fake((B_sym, T, HV_sym, K))
+    beta_fake = make_fake((B_sym, T, HV_sym))
+    h_fake = make_fake((B_sym, HV_sym, V, K))
+    o_fake = make_fake((B_sym, T, HV_sym, V))
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    return cute.compile(
+        launch_fn,
+        q_fake,
+        k_fake,
+        v_fake,
+        g_fake,
+        beta_fake,
+        h_fake,
+        o_fake,
+        cutlass.Float32(0.0),  # scale placeholder
+        cutlass.Float32(0.0),  # eps placeholder
+        stream,
+        HEAD_DIM,
+        options="--enable-tvm-ffi --generate-line-info",
+    )
+
+
+# ==============================================================================
+# DLPACK DISPATCH (fallback when TVM FFI not available)
+# ==============================================================================
+
+_compiled_kernels = {}  # Cache: (seqlen, batch_size, HEAD_DIM) -> compiled kernel
+_cached_scale = {}  # Cache: scale_value -> cutlass.Float32
+_cached_eps = None  # Cached epsilon constant
+_cached_stream = None  # Cached CUstream (same stream reused)
+_cached_stream_handle = None  # Track which CUDA stream handle we cached
+
+
+def _gated_delta_rule_dlpack(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state_source: torch.Tensor,
     scale: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
-    """
-    Gated Delta Rule linear attention kernel.
-
-    Implements the Gated Delta Rule mechanism for decode-phase inference,
-    supporting sequence lengths T=1, T=2, T=3, T=4 and HEAD_DIM 64 or 128.
-
-    Args:
-        A_log: Log decay parameter [HV]
-        a: Alpha gate input [B, T, HV]
-        dt_bias: Delta-t bias [HV]
-        softplus_beta: Softplus beta parameter (default: 1.0)
-        softplus_threshold: Softplus threshold (default: 20.0)
-        q: Query tensor [B, T, H, K] where K=HEAD_DIM (64 or 128)
-        k: Key tensor [B, T, H, K]
-        v: Value tensor [B, T, HV, V] where V=HEAD_DIM
-        b: Beta gate input [B, T, HV]
-        initial_state_source: H state [B, HV, V, K] (K-fast layout), modified in-place
-        initial_state_indices: Not used (for compatibility)
-        use_qk_l2norm_in_kernel: Whether to L2-normalize Q/K in kernel (default: True)
-        scale: Optional attention scale (default: 1/sqrt(K))
-
-    Returns:
-        output: [B, T, HV, V]
-    """
-    global _compiled_kernels
-
-    # Validate required Optional parameters
-    if q is None:
-        raise ValueError("q (query tensor) is required")
-    if k is None:
-        raise ValueError("k (key tensor) is required")
-    if v is None:
-        raise ValueError("v (value tensor) is required")
-    if b is None:
-        raise ValueError("b (beta gate tensor) is required")
-    if initial_state_source is None:
-        raise ValueError("initial_state_source (H state tensor) is required")
+    global _compiled_kernels, _cached_scale, _cached_eps
+    global _cached_stream, _cached_stream_handle
 
     B, T, H, K = q.shape
     assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
-    assert K in [64, 128], f"Supported K=64,128, got K={K}"
     HV = v.shape[2]
     V = v.shape[3]
     HEAD_DIM = K
+    assert K == V, f"K must equal V, got K={K}, V={V}"
+    assert HEAD_DIM in [64, 128], f"Supported HEAD_DIM: 64,128, got {HEAD_DIM}"
+    assert g.shape == (B, T, HV, K), f"g must be [B, T, HV, K], got {g.shape}"
+    assert beta.shape == (B, T, HV), f"beta must be [B, T, HV], got {beta.shape}"
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
     output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
-    q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
-    k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
-    v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
-    a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
-    b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
-    A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
-    dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
-    h_ = from_dlpack(initial_state_source, assumed_align=32, enable_tvm_ffi=True)
-    o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
+    q_ = from_dlpack(q, assumed_align=32)
+    k_ = from_dlpack(k, assumed_align=32)
+    v_ = from_dlpack(v, assumed_align=32)
+    g_ = from_dlpack(g, assumed_align=32)
+    beta_ = from_dlpack(beta, assumed_align=32)
+    h_ = from_dlpack(initial_state_source, assumed_align=32)
+    o_ = from_dlpack(output, assumed_align=32)
 
-    scale_f32 = cutlass.Float32(scale)
-    softplus_beta_f32 = cutlass.Float32(softplus_beta)
-    softplus_threshold_f32 = cutlass.Float32(softplus_threshold)
-    eps_f32 = cutlass.Float32(1e-6)
+    # Cache scalar constants (cutlass.Float32 construction is expensive)
+    if scale not in _cached_scale:
+        _cached_scale[scale] = cutlass.Float32(scale)
+    scale_f32 = _cached_scale[scale]
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if _cached_eps is None:
+        _cached_eps = cutlass.Float32(1e-6)
+    eps_f32 = _cached_eps
+
+    # Cache CUstream object (reuse when same CUDA stream)
+    current_handle = torch.cuda.current_stream().cuda_stream
+    if _cached_stream_handle != current_handle:
+        _cached_stream = cuda.CUstream(current_handle)
+        _cached_stream_handle = current_handle
+    stream = _cached_stream
 
     # Check cache — key includes HEAD_DIM
-    cache_key = (T, B, H, HV, K, V)
+    cache_key = (T, B, HEAD_DIM)
     if cache_key not in _compiled_kernels:
         # Select and compile the appropriate kernel
         if T == 1 and B <= 4:
@@ -1946,19 +1939,15 @@ def gated_delta_rule(
             q_,
             k_,
             v_,
-            a_,
-            b_,
-            A_log_,
-            dt_bias_,
+            g_,
+            beta_,
             h_,
             o_,
             scale_f32,
-            softplus_beta_f32,
-            softplus_threshold_f32,
             eps_f32,
             stream,
             HEAD_DIM,
-            options="--enable-tvm-ffi --generate-line-info",
+            options="--generate-line-info",
         )
 
     # Execute
@@ -1966,17 +1955,95 @@ def gated_delta_rule(
         q_,
         k_,
         v_,
-        a_,
-        b_,
-        A_log_,
-        dt_bias_,
+        g_,
+        beta_,
         h_,
         o_,
         scale_f32,
-        softplus_beta_f32,
-        softplus_threshold_f32,
         eps_f32,
         stream,
+    )
+
+    return output
+
+
+def kda_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    scale: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> torch.Tensor:
+    """
+    KDA (Key-Driven Attention) decode kernel with per-K-dimension gating.
+
+    Implements the KDA decode mechanism with per-K-dimension gating,
+    supporting sequence lengths T=1, T=2, T=3, T=4 and HEAD_DIM 64 or 128.
+
+    Args:
+        q: Query tensor [B, T, H, K] where K=HEAD_DIM (64 or 128)
+        k: Key tensor [B, T, H, K]
+        v: Value tensor [B, T, HV, V] where V=HEAD_DIM
+        g: Pre-computed log-space gate [B, T, HV, K]
+        beta: Pre-sigmoided beta [B, T, HV]
+        initial_state_source: H state [B, HV, V, K] (K-fast layout), modified in-place
+        scale: Optional attention scale (default: 1/sqrt(K))
+        use_qk_l2norm_in_kernel: Whether to L2-normalize Q/K in kernel (default: True)
+
+    Returns:
+        output: [B, T, HV, V]
+    """
+    if not _HAS_TVM_FFI:
+        return _gated_delta_rule_dlpack(
+            q, k, v, g, beta, initial_state_source, scale, use_qk_l2norm_in_kernel
+        )
+
+    global _tvm_kernels
+
+    B, T, H, K = q.shape
+    assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
+    HV = v.shape[2]
+    V = v.shape[3]
+    HEAD_DIM = K
+    assert K == V, f"K must equal V, got K={K}, V={V}"
+    assert HEAD_DIM in [64, 128], f"Supported HEAD_DIM: 64,128, got {HEAD_DIM}"
+    assert g.shape == (B, T, HV, K), f"g must be [B, T, HV, K], got {g.shape}"
+    assert beta.shape == (B, T, HV), f"beta must be [B, T, HV], got {beta.shape}"
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(K)
+
+    output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
+
+    # Use lowBS variant for T=1, B<=4 (more CTAs for better SM utilization)
+    use_lowbs = T == 1 and B <= 4
+    cache_key = (T, HEAD_DIM, use_lowbs)
+    if cache_key not in _tvm_kernels:
+        if use_lowbs:
+            launch_fn = gated_delta_rule_launch_seqlen1_lowBS_1chunk
+        else:
+            launch_fn = {
+                1: gated_delta_rule_launch_seqlen1,
+                2: gated_delta_rule_launch_seqlen2,
+                3: gated_delta_rule_launch_seqlen3,
+                4: gated_delta_rule_launch_seqlen4,
+            }[T]
+        _tvm_kernels[cache_key] = _compile_tvm_ffi(T, launch_fn, HEAD_DIM)
+
+    # Direct torch tensor passing — no DLPack, no scalar wrapping, no stream
+    _tvm_kernels[cache_key](
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state_source,
+        output,
+        scale,
+        1e-6,
     )
 
     return output
