@@ -1841,7 +1841,7 @@ class GatedDeltaRuleKernel:
 # PUBLIC API
 # ==============================================================================
 
-_compiled_kernels = {}  # Cache: (T, HEAD_DIM, B) -> compiled kernel
+_compiled_kernels = {}  # Cache: (T, B, H, HV, K, V) -> compiled kernel
 
 
 def gated_delta_rule(
