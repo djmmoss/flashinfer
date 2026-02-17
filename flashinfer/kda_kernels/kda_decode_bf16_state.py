@@ -1807,7 +1807,7 @@ class GatedDeltaRuleKernel:
 # TVM FFI COMPILATION (zero DLPack overhead)
 # ==============================================================================
 
-_tvm_kernels = {}  # Cache: (T, HEAD_DIM) -> compiled TVM FFI kernel
+_tvm_kernels = {}  # Cache: (T, HEAD_DIM, use_lowbs) -> compiled TVM FFI kernel
 
 
 def _compile_tvm_ffi(T, launch_fn, HEAD_DIM):
@@ -1860,7 +1860,7 @@ def _compile_tvm_ffi(T, launch_fn, HEAD_DIM):
 # DLPACK DISPATCH (fallback when TVM FFI not available)
 # ==============================================================================
 
-_compiled_kernels = {}  # Cache: (seqlen, batch_size, HEAD_DIM) -> compiled kernel
+_compiled_kernels = {}  # Cache: (T, B, H, HV, HEAD_DIM) -> compiled kernel
 _cached_scale = {}  # Cache: scale_value -> cutlass.Float32
 _cached_eps = None  # Cached epsilon constant
 _cached_stream = None  # Cached CUstream (same stream reused)
@@ -1919,8 +1919,8 @@ def _gated_delta_rule_dlpack(
         _cached_stream_handle = current_handle
     stream = _cached_stream
 
-    # Check cache — key includes HEAD_DIM
-    cache_key = (T, B, HEAD_DIM)
+    # Check cache — key includes all shape dimensions to avoid incorrect reuse
+    cache_key = (T, B, H, HV, HEAD_DIM)
     if cache_key not in _compiled_kernels:
         # Select and compile the appropriate kernel
         if T == 1 and B <= 4:
