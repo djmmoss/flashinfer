@@ -45,8 +45,8 @@ NUM_V_HEADS = 32
 def _skip_if_not_sm90_or_later():
     """Skip test if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
     cc = get_compute_capability(torch.device("cuda"))
-    if cc[0] not in [9, 10, 11, 12]:
-        pytest.skip(f"KDA decode requires SM90+ or SM100+, but got SM{cc[0]}{cc[1]}")
+    if cc[0] < 9:
+        pytest.skip(f"KDA decode requires SM90+, but got SM{cc[0]}{cc[1]}")
 
 
 # ============================================================================
@@ -199,12 +199,12 @@ def test_kda_state_update(batch_size, head_dim):
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("seq_len", [1, 2, 3, 4])
-def test_kda_reduces_to_gdn(seq_len, head_dim):
-    """Uniform gate across K dims should produce identical results to itself.
+def test_kda_uniform_gate_determinism(seq_len, head_dim):
+    """Uniform gate across K dims should produce deterministic results.
 
     When all K dimensions of the gate have the same value (uniform gate),
-    KDA reduces to GDN-like scalar gating. We verify this by running the
-    kernel twice with the same uniform gate and checking outputs match exactly.
+    we verify the kernel is deterministic (two runs match exactly) and
+    that outputs match the naive reference implementation.
     """
     _skip_if_not_sm90_or_later()
 

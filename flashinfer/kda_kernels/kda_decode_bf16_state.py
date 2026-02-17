@@ -57,12 +57,9 @@ from flashinfer.gdn_kernels._common import (
 )
 
 # TVM FFI: eliminates DLPack overhead by passing torch.Tensor directly
-try:
-    import tvm_ffi  # noqa: F401
+import importlib.util
 
-    _HAS_TVM_FFI = True
-except ImportError:
-    _HAS_TVM_FFI = False
+_HAS_TVM_FFI = importlib.util.find_spec("tvm_ffi") is not None
 
 
 # KDA-SPECIFIC FUNCTIONS (per-K gate)
@@ -134,7 +131,7 @@ def process_first_token(
     q_sh,
     v_sh,
     reduce_sh,
-    o_head,
+    _o_head,
     g_head,
     beta,
     v_offset,
@@ -1880,6 +1877,10 @@ def _gated_delta_rule_dlpack(
     global _compiled_kernels, _cached_scale, _cached_eps
     global _cached_stream, _cached_stream_handle
 
+    assert use_qk_l2norm_in_kernel, (
+        "KDA kernel always L2-normalizes Q/K; use_qk_l2norm_in_kernel=False is not supported"
+    )
+
     B, T, H, K = q.shape
     assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
     HV = v.shape[2]
@@ -1996,6 +1997,10 @@ def kda_gated_delta_rule(
     Returns:
         output: [B, T, HV, V]
     """
+    assert use_qk_l2norm_in_kernel, (
+        "KDA kernel always L2-normalizes Q/K; use_qk_l2norm_in_kernel=False is not supported"
+    )
+
     if not _HAS_TVM_FFI:
         return _gated_delta_rule_dlpack(
             q, k, v, g, beta, initial_state_source, scale, use_qk_l2norm_in_kernel
