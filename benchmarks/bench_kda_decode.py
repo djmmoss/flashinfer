@@ -51,7 +51,7 @@ except ImportError:
 def kda_decode_flops(
     batch_size: int,
     num_q_heads: int,
-    num_k_heads: int,
+    _num_k_heads: int,
     num_v_heads: int,
     head_size: int,
     seq_len: int = 1,
@@ -92,7 +92,7 @@ def kda_decode_bytes(
     - Output: [B, T, HV, V] - dtype
     """
     num_o_heads = max(num_q_heads, num_v_heads)
-    elem_size = dtype.itemsize
+    elem_size = torch.tensor([], dtype=dtype).element_size()
     state_dtype_bytes = 2  # BF16 state
 
     # Input tensors
