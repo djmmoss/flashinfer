@@ -65,10 +65,9 @@ def kda_decode_flops(
     3. q @ state (output):        2 * K * V
     4. Per-K gate application:    2 * K * V  (K*V element-wise multiply + K exp() calls)
 
-    Note: K = V = head_size for KDA.
+    Note: K = V = head_size for KDA. State ops are per-HV (value) head.
     """
-    num_o_heads = max(num_q_heads, num_v_heads)
-    total_flops = 8 * seq_len * batch_size * num_o_heads * head_size * head_size
+    total_flops = 8 * seq_len * batch_size * num_v_heads * head_size * head_size
     return total_flops
 
 
@@ -91,27 +90,26 @@ def kda_decode_bytes(
     - State (read + write): [B, HV, V, K] - bf16 (2 bytes)
     - Output: [B, T, HV, V] - dtype
     """
-    num_o_heads = max(num_q_heads, num_v_heads)
     elem_size = torch.tensor([], dtype=dtype).element_size()
     state_dtype_bytes = 2  # BF16 state
 
-    # Input tensors
+    # Input tensors: q/k use H (query heads), v uses HV (value heads)
     q_bytes = batch_size * seq_len * num_q_heads * head_size * elem_size
     k_bytes = batch_size * seq_len * num_k_heads * head_size * elem_size
     v_bytes = batch_size * seq_len * num_v_heads * head_size * elem_size
 
-    # Per-K gate: [B, T, HV, K] - the extra input vs GDN
-    g_bytes = batch_size * seq_len * num_o_heads * head_size * elem_size
+    # Per-K gate: [B, T, HV, K]
+    g_bytes = batch_size * seq_len * num_v_heads * head_size * elem_size
 
     # Beta: [B, T, HV]
-    beta_bytes = batch_size * seq_len * num_o_heads * elem_size
+    beta_bytes = batch_size * seq_len * num_v_heads * elem_size
 
     # Output: [B, T, HV, V]
-    o_bytes = batch_size * seq_len * num_o_heads * head_size * elem_size
+    o_bytes = batch_size * seq_len * num_v_heads * head_size * elem_size
 
     # State: [B, HV, V, K] read + write
     state_bytes = (
-        2 * batch_size * num_o_heads * head_size * head_size * state_dtype_bytes
+        2 * batch_size * num_v_heads * head_size * head_size * state_dtype_bytes
     )
 
     total_bytes = (
@@ -142,24 +140,22 @@ def bench_kda_decode(
 
     assert seq_len in [1, 2, 3, 4], f"KDA decode supports T=1,2,3,4, got T={seq_len}"
 
-    num_o_heads = max(num_q_heads, num_v_heads)
-
     # Create inputs
     T = seq_len
     q = torch.randn(batch_size, T, num_q_heads, head_size, dtype=dtype, device="cuda")
-    k = torch.randn(batch_size, T, num_k_heads, head_size, dtype=dtype, device="cuda")
+    k = torch.randn(batch_size, T, num_q_heads, head_size, dtype=dtype, device="cuda")
     v = torch.randn(batch_size, T, num_v_heads, head_size, dtype=dtype, device="cuda")
 
     # KDA-specific: per-K log-space gate [B, T, HV, K]
-    g = torch.randn(batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda")
+    g = torch.randn(batch_size, T, num_v_heads, head_size, dtype=dtype, device="cuda")
 
     # Beta: [B, T, HV] (pre-sigmoided)
-    beta = torch.randn(batch_size, T, num_o_heads, dtype=dtype, device="cuda")
+    beta = torch.randn(batch_size, T, num_v_heads, dtype=dtype, device="cuda")
 
     # Initial state: [B, HV, V, K] (K-last layout, BF16)
     state = torch.randn(
         batch_size,
-        num_o_heads,
+        num_v_heads,
         head_size,
         head_size,
         dtype=torch.bfloat16,
