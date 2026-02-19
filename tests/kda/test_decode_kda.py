@@ -33,8 +33,8 @@ from flashinfer.kda_kernels.kda_decode_bf16_state import (
 
 
 # BF16 tolerances
-ATOL = 1e-1
-RTOL = 5e-2
+ATOL = 5e-3
+RTOL = 5e-3
 
 # Fixed head configuration
 NUM_Q_HEADS = 16
