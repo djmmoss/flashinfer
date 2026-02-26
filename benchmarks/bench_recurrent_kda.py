@@ -17,7 +17,7 @@ limitations under the License.
 """
 Recurrent KDA (Key-Driven Attention) Benchmark
 
-Benchmarks the recurrent KDA decode kernel with per-K-dimension gating.
+Benchmarks the recurrent KDA kernel with per-K-dimension gating.
 KDA differs from GDN by having gate g[B, T, HV, K] instead of a scalar gate.
 
 Usage:
@@ -32,7 +32,7 @@ import torch
 
 from flashinfer.testing import bench_gpu_time
 
-# Import the KDA decode kernel
+# Import the recurrent KDA kernel
 try:
     from flashinfer.kda_kernels import recurrent_kda
 
@@ -79,7 +79,7 @@ def recurrent_kda_bytes(
     seq_len: int = 1,
 ) -> int:
     """
-    Calculate memory bytes for KDA decode.
+    Calculate memory bytes for recurrent KDA.
 
     Includes:
     - Q, K, V tensors: [B, T, H, K] - dtype
@@ -132,11 +132,11 @@ def bench_recurrent_kda(
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
-    """Benchmark KDA decode kernel for T=1."""
+    """Benchmark recurrent KDA kernel for T=1."""
     if not RECURRENT_KDA_AVAILABLE:
-        raise RuntimeError("KDA decode kernel is not available")
+        raise RuntimeError("recurrent KDA kernel is not available")
 
-    assert seq_len == 1, f"KDA decode supports T=1 only, got T={seq_len}"
+    assert seq_len == 1, f"recurrent KDA supports T=1 only, got T={seq_len}"
 
     # Create inputs
     T = seq_len
@@ -209,9 +209,9 @@ def bench_recurrent_kda(
 
 
 def run_recurrent_kda_benchmark(args, dtype):
-    """Run KDA decode benchmark for T=1."""
+    """Run recurrent KDA benchmark for T=1."""
     if not RECURRENT_KDA_AVAILABLE:
-        print("Error: KDA decode kernel is not available.")
+        print("Error: recurrent KDA kernel is not available.")
         print("Make sure flashinfer.kda_kernels.recurrent_kda is importable.")
         return
 
