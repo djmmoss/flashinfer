@@ -1056,7 +1056,7 @@ def _dispatch_kernel(q, k, v, g, beta, state, output, A_log, dt_bias,
     )
 
 
-def cutedsl_kda_decode(
+def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

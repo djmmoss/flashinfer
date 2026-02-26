@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.kda_kernels import cutedsl_kda_decode
+from flashinfer.kda_kernels import recurrent_kda
 
 try:
     from fla.ops.kda import fused_recurrent_kda
@@ -148,7 +148,7 @@ def test_cutedsl_vs_naive(
     )
 
     # CuTe DSL kernel (bf16 state [B, H, V, K], in-kernel L2 norm)
-    tri, tri_ht = cutedsl_kda_decode(
+    tri, tri_ht = recurrent_kda(
         q=q, k=k, v=v, g=g, beta=beta,
         scale=scale,
         initial_state=h0_bf16.clone(),
@@ -206,7 +206,7 @@ def test_cutedsl_vs_fla(
     )
 
     # CuTe DSL (bf16 state [B, H, V, K])
-    tri, tri_ht = cutedsl_kda_decode(
+    tri, tri_ht = recurrent_kda(
         q=q, k=k, v=v, g=g, beta=beta,
         scale=scale,
         initial_state=h0_bf16.clone(),
@@ -320,7 +320,7 @@ def test_vllm_decode(
     ref_out = torch.cat(ref_outputs, dim=1)
 
     # CuTe DSL kernel with cu_seqlens + ssm_state_indices (bf16 state)
-    tri_out, _ = cutedsl_kda_decode(
+    tri_out, _ = recurrent_kda(
         q=q, k=k, v=v, g=g, beta=beta,
         A_log=A_log, dt_bias=dt_bias,
         scale=scale,

@@ -15,4 +15,4 @@ limitations under the License.
 """
 
 # Re-export for backwards compatibility.
-from .recurrent_kda import cutedsl_kda_decode  # noqa: F401
+from .recurrent_kda import recurrent_kda  # noqa: F401
