@@ -1074,32 +1074,66 @@ def recurrent_kda(
     ssm_state_indices: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""
-    Recurrent KDA (Key-Driven Attention) decode kernel via CuTe DSL.
+    r"""Recurrent KDA (Key-Driven Attention) decode kernel.
 
-    Single-token (T=1) recurrent linear attention with per-key-dimension gating.
-    State is updated in-place: ``S = diag(exp(g)) @ S + beta * k * (v - S^T k)``
+    This implements the decode phase of KDA linear attention with per-key-dimension
+    gating, processing one token at a time and updating the recurrent state in-place.
+    State update: ``S = diag(exp(g)) @ S + beta * k * (v - S^T k)``
 
     Args:
-        q: queries ``[B, 1, H, K]``, or ``[1, total_tokens, H, K]`` with cu_seqlens
-        k: keys ``[B, 1, H, K]``
-        v: values ``[B, 1, HV, V]`` (GQA when ``HV != H``)
-        g: gates ``[B, 1, HV, K]`` (log-space if pre-computed, raw if use_gate_in_kernel)
-        beta: learning rates ``[B, 1, HV]`` (pre-sigmoided)
-        A_log: log gate param ``[H]`` f32 (required when use_gate_in_kernel=True)
-        dt_bias: per-head-K bias ``[H*K]`` f32
-        scale: attention scale (default ``1/sqrt(K)``)
-        initial_state: ``[N, HV, V, K]`` bf16 (default: zero-initialized)
-        output_final_state: whether to return the final state
-        use_qk_l2norm_in_kernel: L2-normalize Q and K in kernel
-        use_gate_in_kernel: compute gate from A_log and g inside kernel
-        lower_bound: if set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-        cu_seqlens: ``[N+1]`` int32 cumulative sequence lengths
-        ssm_state_indices: ``[N]`` int32 state cache indices
-        output: pre-allocated output buffer ``[B, 1, HV, V]``
+        q (torch.Tensor):
+            Current query of shape ``[B, 1, H, K]``, or ``[1, total_tokens, H, K]``
+            when using ``cu_seqlens``. Must be bfloat16.
+        k (torch.Tensor):
+            Current key of shape ``[B, 1, H, K]``. Must be bfloat16.
+        v (torch.Tensor):
+            Current value of shape ``[B, 1, HV, V]``. Must be bfloat16.
+            GQA is applied when ``HV != H``.
+        g (torch.Tensor):
+            Per-K-dimension gate of shape ``[B, 1, HV, K]``. Must be bfloat16.
+            Log-space if pre-computed, raw input if ``use_gate_in_kernel=True``.
+        beta (torch.Tensor):
+            Delta-rule learning rate of shape ``[B, 1, HV]``. Must be bfloat16.
+            Pre-sigmoided.
+        A_log (Optional[torch.Tensor]):
+            Log decay parameter of shape ``[H]``. Must be float32.
+            Required when ``use_gate_in_kernel=True``.
+        dt_bias (Optional[torch.Tensor]):
+            Per-head-K decay bias of shape ``[H*K]``. Must be float32.
+        scale (Optional[float]):
+            Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
+        initial_state (Optional[torch.Tensor]):
+            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
+            If None, zero-initialized. Updated in-place.
+        output_final_state (bool):
+            Whether to return the final state. Default: ``False``.
+        use_qk_l2norm_in_kernel (bool):
+            Whether to apply L2 normalization to Q and K. Default: ``True``.
+        use_gate_in_kernel (bool):
+            Whether to compute the gate inside the kernel from ``A_log`` and ``g``.
+            Default: ``False``.
+        lower_bound (Optional[float]):
+            If set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
+            gate formula instead of softplus.
+        cu_seqlens (Optional[torch.Tensor]):
+            Cumulative sequence lengths of shape ``[N+1]``. Must be int32.
+        ssm_state_indices (Optional[torch.Tensor]):
+            State cache indices of shape ``[N]``. Must be int32.
+        output (Optional[torch.Tensor]):
+            Pre-allocated output tensor of shape ``[B, 1, HV, V]``.
+            If None, will be allocated automatically.
 
     Returns:
-        ``(output, final_state)`` where final_state is None unless output_final_state=True.
+        Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            - output: Output tensor of shape ``[B, 1, HV, V]``
+            - state: Updated state of shape ``[N, HV, V, K]`` if
+              ``output_final_state=True``, else ``None``
+
+    Note:
+        - Requires SM100 (Blackwell) architecture
+        - State is bfloat16 ``[N, HV, V, K]`` and updated in-place
+        - HEAD_DIM (K=V) must be 64 or 128
+        - When using ``cu_seqlens``, batch size ``B`` must be 1
     """
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
