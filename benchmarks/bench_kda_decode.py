@@ -34,9 +34,7 @@ from flashinfer.testing import bench_gpu_time
 
 # Import the KDA decode kernel
 try:
-    from flashinfer.kda_kernels.kda_decode_bf16_state import (
-        recurrent_kda as kda_decode,
-    )
+    from flashinfer.kda_kernels import cutedsl_kda_decode
 
     KDA_DECODE_AVAILABLE = True
 except ImportError:
@@ -167,13 +165,13 @@ def bench_kda_decode(
 
     # Benchmark with bench_gpu_time (CUPTI for accurate kernel timing)
     kernel_times_ms = bench_gpu_time(
-        lambda: kda_decode(
+        lambda: cutedsl_kda_decode(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
-            initial_state_source=state,
+            initial_state=state,
             scale=scale,
             use_qk_l2norm_in_kernel=True,
         ),

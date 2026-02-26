@@ -21,30 +21,18 @@ KDA (Key-Driven Attention) Kernels - CuTe DSL Implementations
 Per-K-dimension gating variant of GDN. Gate g[B,T,HV,K] applied per-lane
 instead of GDN's scalar broadcast.
 
-Exported Kernels:
-- recurrent_kda: Low-level KDA decode kernel dispatch (T=1)
-- cutedsl_kda_decode: fla-compatible wrapper with state management
-- RecurrentKDAKernel: Kernel class for advanced usage
+Exported:
+- cutedsl_kda_decode: Recurrent KDA decode kernel (T=1)
 """
 
-from typing import Optional, Type
-
 try:
-    from .kda_decode_bf16_state import (
-        recurrent_kda,
-        cutedsl_kda_decode,
-        RecurrentKDAKernel,
-    )
+    from .recurrent_kda import cutedsl_kda_decode
 
     _has_cute_dsl = True
 except ImportError:
     _has_cute_dsl = False
-    recurrent_kda = None  # type: ignore
     cutedsl_kda_decode = None  # type: ignore
-    RecurrentKDAKernel: Optional[Type] = None  # type: ignore
 
 __all__ = [
-    "recurrent_kda",
     "cutedsl_kda_decode",
-    "RecurrentKDAKernel",
 ]

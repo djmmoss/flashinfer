@@ -14,5 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Re-export from the main kernel module for backwards compatibility.
-from .kda_decode_bf16_state import cutedsl_kda_decode  # noqa: F401
+# Re-export for backwards compatibility.
+from .recurrent_kda import cutedsl_kda_decode  # noqa: F401

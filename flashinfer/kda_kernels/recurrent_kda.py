@@ -971,227 +971,89 @@ def recurrent_kda_launch(
 
 
 # ==============================================================================
-# KERNEL CLASS
-# ==============================================================================
-
-
-class RecurrentKDAKernel:
-    """
-    Recurrent KDA Kernel for linear attention decode (T=1 only).
-
-    Args:
-        head_dim: Head dimension (64 or 128)
-    """
-
-    def __init__(self, head_dim: int = 128):
-        assert head_dim in [64, 128], f"Supported head_dim: 64,128, got {head_dim}"
-        self.head_dim = head_dim
-        self._compiled_kernel = None
-
-    def _get_launch_fn(self):
-        return recurrent_kda_launch
-
-
-# ==============================================================================
 # PUBLIC API
 # ==============================================================================
 
-# ==============================================================================
-# TVM FFI COMPILATION
-# ==============================================================================
-
-_tvm_kernels = {}  # Cache: (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS) -> compiled
-_dummy_cache = {}  # Cache: device -> dict of pre-allocated dummy tensors
+_tvm_kernels = {}  # (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS) -> compiled
+_dummy_cache = {}  # device -> dict of pre-allocated dummy tensors
 
 
-def _compile_tvm_ffi(launch_fn, HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS):
-    """Compile kernel with fake tensors and symbolic dims for TVM FFI dispatch.
-
-    Uses cute.sym_int() for dynamic dims (B, H, HV, N, HV_state, etc.) so we
-    compile once per (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS).
-    """
-    B_sym = cute.sym_int()
-    H_sym = cute.sym_int()
-    HV_sym = cute.sym_int()
+def _compile_tvm_ffi(HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS):
+    """Compile kernel with symbolic dims for TVM FFI dispatch."""
+    B, H, HV, N = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     K, V = HEAD_DIM, HEAD_DIM
-    # Separate symbolic dim for state batch — in cu_seqlens mode,
-    # q.shape[0]=1 but state.shape[0]=N (number of sequences)
-    N_sym = cute.sym_int()
 
     def make_fake(shape, dtype=cute.BFloat16):
-        ndim = len(shape)
         return cute.runtime.make_fake_compact_tensor(
             dtype, shape, assumed_align=32,
-            stride_order=tuple(reversed(range(ndim))),  # row-major
+            stride_order=tuple(reversed(range(len(shape)))),
         )
 
-    # In cu_seqlens mode, T dim of Q/K/V/G/Beta/O is total_tokens (symbolic)
     T_dim = cute.sym_int() if USE_CU_SEQLENS == 1 else 1
-    q_fake = make_fake((B_sym, T_dim, H_sym, K))
-    k_fake = make_fake((B_sym, T_dim, H_sym, K))
-    v_fake = make_fake((B_sym, T_dim, HV_sym, V))
-    g_fake = make_fake((B_sym, T_dim, HV_sym, K))
-    beta_fake = make_fake((B_sym, T_dim, HV_sym))
-    # State uses N_sym (separate from B_sym) so cu_seqlens mode works
-    # when q.shape[0] != state.shape[0]
-    HV_state = cute.sym_int()
-    h_fake = make_fake((N_sym, HV_state, V, K))
-    o_fake = make_fake((B_sym, T_dim, HV_sym, V))
-    ALog_sym = cute.sym_int()  # separate from H_sym to allow dummy tensors
-    HK_sym = cute.sym_int()   # H*K, separate symbolic dim
-    alog_fake = make_fake((ALog_sym,), dtype=cute.Float32)
-    dtbias_fake = make_fake((HK_sym,), dtype=cute.Float32)
-    # cu_seqlens [N+1] and ssm_state_indices [N] need separate symbolic dims
-    CuSeqlens_sym = cute.sym_int()
-    SsiB_sym = cute.sym_int()
-    cu_seqlens_fake = make_fake((CuSeqlens_sym,), dtype=cute.Int32)
-    ssm_state_indices_fake = make_fake((SsiB_sym,), dtype=cute.Int32)
-    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    HV_state, ALog_sym, HK_sym = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    CuSeqlens_sym, SsiB_sym = cute.sym_int(), cute.sym_int()
 
     return cute.compile(
-        launch_fn,
-        q_fake, k_fake, v_fake, g_fake, beta_fake, h_fake, o_fake,
-        alog_fake, dtbias_fake,
-        cu_seqlens_fake, ssm_state_indices_fake,
-        cutlass.Float32(0.0),  # scale placeholder
-        cutlass.Float32(0.0),  # eps placeholder
-        cutlass.Float32(0.0),  # lower_bound placeholder
-        stream,
-        HEAD_DIM,
-        USE_GATE_IN_KERNEL,
-        HAS_DT_BIAS,
-        USE_LOWER_BOUND,
-        USE_CU_SEQLENS,
+        recurrent_kda_launch,
+        make_fake((B, T_dim, H, K)),            # q
+        make_fake((B, T_dim, H, K)),            # k
+        make_fake((B, T_dim, HV, V)),           # v
+        make_fake((B, T_dim, HV, K)),           # g
+        make_fake((B, T_dim, HV)),              # beta
+        make_fake((N, HV_state, V, K)),         # state
+        make_fake((B, T_dim, HV, V)),           # output
+        make_fake((ALog_sym,), dtype=cute.Float32),   # A_log
+        make_fake((HK_sym,), dtype=cute.Float32),     # dt_bias
+        make_fake((CuSeqlens_sym,), dtype=cute.Int32), # cu_seqlens
+        make_fake((SsiB_sym,), dtype=cute.Int32),      # ssm_state_indices
+        cutlass.Float32(0.0),                   # scale
+        cutlass.Float32(0.0),                   # eps
+        cutlass.Float32(0.0),                   # lower_bound
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
 
-def recurrent_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state_source: torch.Tensor,
-    A_log: Optional[torch.Tensor] = None,
-    dt_bias: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
-    use_qk_l2norm_in_kernel: bool = True,
-    use_gate_in_kernel: bool = False,
-    lower_bound: Optional[float] = None,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    ssm_state_indices: Optional[torch.Tensor] = None,
-    output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    r"""
-    Low-level kernel dispatch. Compiles and launches the CuTe DSL kernel
-    via TVM FFI. State is modified in-place.
-
-    Args:
-        q (torch.Tensor):
-            queries of shape `[B, 1, H, K]` where `K` is HEAD_DIM (64 or 128).
-        k (torch.Tensor):
-            keys of shape `[B, 1, H, K]`.
-        v (torch.Tensor):
-            values of shape `[B, 1, HV, V]` where `V` = HEAD_DIM.
-            GQA is applied when `HV != H`.
-        g (torch.Tensor):
-            gates of shape `[B, 1, HV, K]`.
-            Log-space if pre-computed, raw input if ``use_gate_in_kernel=True``.
-        beta (torch.Tensor):
-            pre-sigmoided learning rates of shape `[B, 1, HV]`.
-        initial_state_source (torch.Tensor):
-            state of shape `[B, HV, V, K]` in bf16. **Modified in-place**.
-        A_log (Optional[torch.Tensor]):
-            log gate parameter of shape `[H]` in float32.
-            Required when ``use_gate_in_kernel=True``. Default: ``None``.
-        dt_bias (Optional[torch.Tensor]):
-            per-head-K bias of shape `[H*K]` in float32. Default: ``None``.
-        scale (Optional[float]):
-            scale factor for attention scores.
-            If not provided, defaults to `1 / sqrt(K)`. Default: ``None``.
-        use_qk_l2norm_in_kernel (bool):
-            whether to L2-normalize Q and K in the kernel. Default: ``True``.
-        use_gate_in_kernel (bool):
-            whether to compute the gate inside the kernel from ``A_log`` and ``g``.
-            Default: ``False``.
-        lower_bound (Optional[float]):
-            if set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-            gate formula. Default: ``None``.
-        cu_seqlens (Optional[torch.Tensor]):
-            cumulative sequence lengths of shape `[N+1]` in int32.
-        ssm_state_indices (Optional[torch.Tensor]):
-            state cache indices of shape `[N]` in int32.
-        output (Optional[torch.Tensor]):
-            pre-allocated output buffer of shape `[B, 1, HV, V]`.
-
-    Returns:
-        output (torch.Tensor):
-            output of shape `[B, 1, HV, V]`.
-    """
-    USE_GATE_IN_KERNEL = 1 if use_gate_in_kernel else 0
-    HAS_DT_BIAS = 1 if dt_bias is not None else 0
-    USE_LOWER_BOUND = 1 if lower_bound is not None else 0
-    USE_CU_SEQLENS = 1 if cu_seqlens is not None else 0
-
-    global _tvm_kernels
-
-    H, K = q.shape[2], q.shape[3]
-    HV = v.shape[2]
-    V = v.shape[3]
-    HEAD_DIM = K
-    assert K == V, f"K must equal V, got K={K}, V={V}"
-    assert HEAD_DIM in [64, 128], f"Supported HEAD_DIM: 64,128, got {HEAD_DIM}"
-
-    # Cached dummy tensors — allocated once per device, reused every call
+def _get_dummy_tensors(device):
+    """Get or create cached dummy tensors for a device."""
     global _dummy_cache
-    dev = q.device
-    if dev not in _dummy_cache:
-        _dummy_cache[dev] = {
-            'f32_1': torch.zeros(1, device=dev, dtype=torch.float32),
-            'i32_1': torch.zeros(1, device=dev, dtype=torch.int32),
+    if device not in _dummy_cache:
+        _dummy_cache[device] = {
+            'f32_1': torch.zeros(1, device=device, dtype=torch.float32),
+            'i32_1': torch.zeros(1, device=device, dtype=torch.int32),
         }
-    _dc = _dummy_cache[dev]
+    return _dummy_cache[device]
 
-    if A_log is None:
-        A_log = _dc['f32_1']
-    if dt_bias is None:
-        dt_bias = _dc['f32_1']
-    if cu_seqlens is None:
-        cu_seqlens = _dc['i32_1']
-    if ssm_state_indices is None:
-        ssm_state_indices = _dc['i32_1']
 
-    lower_bound_f = lower_bound if lower_bound is not None else 0.0
+def _dispatch_kernel(q, k, v, g, beta, state, output, A_log, dt_bias,
+                     cu_seqlens, ssm_state_indices, scale, lower_bound,
+                     use_gate_in_kernel):
+    """Compile (if needed) and launch the TVM FFI kernel."""
+    global _tvm_kernels
+    K = q.shape[3]
+    USE_GATE = 1 if use_gate_in_kernel else 0
+    HAS_BIAS = 1 if dt_bias is not None else 0
+    USE_LB = 1 if lower_bound is not None else 0
+    USE_CU = 1 if cu_seqlens is not None else 0
 
-    if scale is None:
-        scale = 1.0 / math.sqrt(K)
+    dc = _get_dummy_tensors(q.device)
+    a_log = A_log if A_log is not None else dc['f32_1']
+    dt = dt_bias if dt_bias is not None else dc['f32_1']
+    cu = cu_seqlens if cu_seqlens is not None else dc['i32_1']
+    ssi = ssm_state_indices if ssm_state_indices is not None else dc['i32_1']
 
-    if output is None:
-        output = torch.empty(q.shape[0], 1, HV, V, device=dev, dtype=q.dtype)
+    key = (K, USE_GATE, HAS_BIAS, USE_LB, USE_CU)
+    if key not in _tvm_kernels:
+        _tvm_kernels[key] = _compile_tvm_ffi(K, USE_GATE, HAS_BIAS, USE_LB, USE_CU)
 
-    cache_key = (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS)
-    if cache_key not in _tvm_kernels:
-        launch_fn = recurrent_kda_launch
-        _tvm_kernels[cache_key] = _compile_tvm_ffi(
-            launch_fn, HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS
-        )
-
-    # Direct torch tensor passing via TVM FFI
-    _tvm_kernels[cache_key](
-        q, k, v, g, beta, initial_state_source, output,
-        A_log, dt_bias,
-        cu_seqlens, ssm_state_indices,
-        scale, 1e-6, lower_bound_f,
+    _tvm_kernels[key](
+        q, k, v, g, beta, state, output,
+        a_log, dt, cu, ssi,
+        scale if scale is not None else 1.0 / math.sqrt(K),
+        1e-6,
+        lower_bound if lower_bound is not None else 0.0,
     )
-
-    return output
-
-
-# ==============================================================================
-# HIGH-LEVEL WRAPPER (fla-compatible API)
-# ==============================================================================
-
 
 
 def cutedsl_kda_decode(
@@ -1213,99 +1075,38 @@ def cutedsl_kda_decode(
     output: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""
-    fla-compatible wrapper for the CuTe DSL recurrent KDA decode kernel.
+    Recurrent KDA (Key-Driven Attention) decode kernel via CuTe DSL.
 
-    Handles state allocation/zero-init, cu_seqlens preparation, and
-    output_final_state. Delegates to :func:`recurrent_kda` for kernel dispatch.
+    Single-token (T=1) recurrent linear attention with per-key-dimension gating.
+    State is updated in-place: ``S = diag(exp(g)) @ S + beta * k * (v - S^T k)``
 
     Args:
-        q (torch.Tensor):
-            queries of shape `[B, 1, H, K]`, or `[1, total_tokens, H, K]`
-            when using ``cu_seqlens``.
-        k (torch.Tensor):
-            keys of shape `[B, 1, H, K]`.
-        v (torch.Tensor):
-            values of shape `[B, 1, HV, V]`.
-            GQA is applied when `HV != H`.
-        g (torch.Tensor):
-            gates of shape `[B, 1, HV, K]`.
-        beta (torch.Tensor):
-            pre-sigmoided learning rates of shape `[B, 1, HV]`.
-        A_log (Optional[torch.Tensor]):
-            log gate parameter of shape `[H]` in float32. Default: ``None``.
-        dt_bias (Optional[torch.Tensor]):
-            per-head-K bias of shape `[H*K]` in float32. Default: ``None``.
-        scale (Optional[float]):
-            scale factor for attention scores.
-            If not provided, defaults to `1 / sqrt(K)`. Default: ``None``.
-        initial_state (Optional[torch.Tensor]):
-            initial state of shape `[N, HV, V, K]` in bf16 for `N` input sequences.
-            For equal-length input sequences, `N` equals the batch size `B`.
-            Default: ``None`` (zero-initialized).
-        output_final_state (bool):
-            whether to return the final state. Default: ``False``.
-        use_qk_l2norm_in_kernel (bool):
-            whether to L2-normalize Q and K in the kernel. Default: ``True``.
-        use_gate_in_kernel (bool):
-            whether to compute the gate inside the kernel from ``A_log`` and ``g``.
-            Default: ``False``.
-        lower_bound (Optional[float]):
-            if set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-            gate formula. Default: ``None``.
-        cu_seqlens (Optional[torch.Tensor]):
-            cumulative sequence lengths of shape `[N+1]` in int32, consistent with
-            the FlashAttention API. Default: ``None``.
-        ssm_state_indices (Optional[torch.Tensor]):
-            state cache indices of shape `[N]` in int32, for non-contiguous state
-            access (e.g. paged KV cache). Default: ``None``.
-        output (Optional[torch.Tensor]):
-            pre-allocated output buffer of shape `[B, 1, HV, V]`.
+        q: queries ``[B, 1, H, K]``, or ``[1, total_tokens, H, K]`` with cu_seqlens
+        k: keys ``[B, 1, H, K]``
+        v: values ``[B, 1, HV, V]`` (GQA when ``HV != H``)
+        g: gates ``[B, 1, HV, K]`` (log-space if pre-computed, raw if use_gate_in_kernel)
+        beta: learning rates ``[B, 1, HV]`` (pre-sigmoided)
+        A_log: log gate param ``[H]`` f32 (required when use_gate_in_kernel=True)
+        dt_bias: per-head-K bias ``[H*K]`` f32
+        scale: attention scale (default ``1/sqrt(K)``)
+        initial_state: ``[N, HV, V, K]`` bf16 (default: zero-initialized)
+        output_final_state: whether to return the final state
+        use_qk_l2norm_in_kernel: L2-normalize Q and K in kernel
+        use_gate_in_kernel: compute gate from A_log and g inside kernel
+        lower_bound: if set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
+        cu_seqlens: ``[N+1]`` int32 cumulative sequence lengths
+        ssm_state_indices: ``[N]`` int32 state cache indices
+        output: pre-allocated output buffer ``[B, 1, HV, V]``
 
     Returns:
-        o (torch.Tensor):
-            output of shape `[B, 1, HV, V]`.
-        final_state (torch.Tensor):
-            final state of shape `[N, HV, V, K]` if ``output_final_state=True``
-            else ``None``.
-
-    Note:
-        - Requires SM100 (Blackwell) architecture
-        - State is bf16 `[N, HV, V, K]` and updated in-place
-        - HEAD_DIM (K=V) must be 64 or 128
-        - When using ``cu_seqlens``, batch size `B` must be 1
-
-    Examples::
-        >>> import torch
-        >>> from flashinfer.kda_kernels import cutedsl_kda_decode
-        # batched decode
-        >>> B, H, HV, K, V = 4, 4, 8, 128, 128
-        >>> q = torch.randn(B, 1, H, K, device='cuda', dtype=torch.bfloat16)
-        >>> k = torch.randn(B, 1, H, K, device='cuda', dtype=torch.bfloat16)
-        >>> v = torch.randn(B, 1, HV, V, device='cuda', dtype=torch.bfloat16)
-        >>> g = torch.randn(B, 1, HV, K, device='cuda', dtype=torch.bfloat16)
-        >>> beta = torch.rand(B, 1, HV, device='cuda', dtype=torch.bfloat16).sigmoid()
-        >>> h0 = torch.randn(B, HV, V, K, device='cuda', dtype=torch.bfloat16)
-        >>> o, ht = cutedsl_kda_decode(q, k, v, g, beta, initial_state=h0, output_final_state=True)
-        # variable-length decode with cu_seqlens
-        >>> cu_seqlens = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device='cuda')
-        >>> q_flat = q.reshape(1, B, H, K)
-        >>> k_flat = k.reshape(1, B, H, K)
-        >>> v_flat = v.reshape(1, B, HV, V)
-        >>> g_flat = g.reshape(1, B, HV, K)
-        >>> beta_flat = beta.reshape(1, B, HV)
-        >>> o_var, ht_var = cutedsl_kda_decode(
-        ...     q_flat, k_flat, v_flat, g_flat, beta_flat,
-        ...     initial_state=h0, output_final_state=True, cu_seqlens=cu_seqlens
-        ... )
+        ``(output, final_state)`` where final_state is None unless output_final_state=True.
     """
-    # --- Validate inputs ---
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
+    device = q.device
     assert K == V, f"K must equal V, got K={K}, V={V}"
     assert K in (64, 128), f"HEAD_DIM must be 64 or 128, got K={K}"
     assert q.dtype == torch.bfloat16, f"q must be bfloat16, got {q.dtype}"
-
-    device = q.device
 
     if use_gate_in_kernel:
         assert A_log is not None, "A_log is required when use_gate_in_kernel=True"
@@ -1313,18 +1114,14 @@ def cutedsl_kda_decode(
     if lower_bound is not None:
         assert use_gate_in_kernel, "lower_bound requires use_gate_in_kernel=True"
 
-    # --- Prepare cu_seqlens / state ---
+    # Prepare state and cu_seqlens
     if cu_seqlens is not None:
         if B != 1:
-            raise ValueError(
-                f"Batch size must be 1 when using cu_seqlens, got B={B}. "
-                f"Flatten variable-length inputs before processing."
-            )
+            raise ValueError(f"Batch size must be 1 with cu_seqlens, got B={B}")
         N = cu_seqlens.shape[0] - 1
         cu_seqlens_i32 = cu_seqlens.to(torch.int32)
-        ssi = ssm_state_indices.to(torch.int32) if ssm_state_indices is not None else \
-            torch.arange(N, dtype=torch.int32, device=device)
-
+        ssi = (ssm_state_indices.to(torch.int32) if ssm_state_indices is not None
+               else torch.arange(N, dtype=torch.int32, device=device))
         if initial_state is None:
             max_idx = int(ssi.max().item()) + 1 if N > 0 else N
             state = torch.zeros(max_idx, HV, V, K, device=device, dtype=torch.bfloat16)
@@ -1335,33 +1132,22 @@ def cutedsl_kda_decode(
         assert T == 1, f"Decode only supports T=1, got T={T}"
         cu_seqlens_i32 = None
         ssi = None
-
         if initial_state is None:
             state = torch.zeros(B, HV, V, K, device=device, dtype=torch.bfloat16)
         elif ssm_state_indices is not None:
             state = initial_state[ssm_state_indices].contiguous()
         else:
             state = initial_state.contiguous()
-
         if (output is not None and output.shape == (B, 1, HV, V)
                 and output.dtype == q.dtype and output.device == device):
             out_buf = output
         else:
             out_buf = torch.empty(B, 1, HV, V, device=device, dtype=q.dtype)
 
-    # --- Dispatch kernel ---
-    recurrent_kda(
-        q=q, k=k, v=v, g=g, beta=beta,
-        initial_state_source=state,
-        A_log=A_log, dt_bias=dt_bias,
-        scale=scale,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        use_gate_in_kernel=use_gate_in_kernel,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens_i32,
-        ssm_state_indices=ssi,
-        output=out_buf,
+    _dispatch_kernel(
+        q, k, v, g, beta, state, out_buf,
+        A_log, dt_bias, cu_seqlens_i32, ssi,
+        scale, lower_bound, use_gate_in_kernel,
     )
 
-    final_state = state if output_final_state else None
-    return out_buf, final_state
+    return out_buf, state if output_final_state else None
