@@ -15,15 +15,15 @@ limitations under the License.
 """
 
 """
-KDA (Key-Driven Attention) Decode Benchmark
+Recurrent KDA (Key-Driven Attention) Benchmark
 
-Benchmarks the KDA CuTe DSL decode kernel with per-K-dimension gating.
+Benchmarks the recurrent KDA decode kernel with per-K-dimension gating.
 KDA differs from GDN by having gate g[B, T, HV, K] instead of a scalar gate.
 
 Usage:
-    python benchmarks/bench_kda_decode.py --batch-size 1 4 16 64 128 256
-    python benchmarks/bench_kda_decode.py --head-size 64 --batch-size 1 32 128
-    python benchmarks/bench_kda_decode.py --seq-len 1 2 3 4 --batch-size 1 32
+    python benchmarks/bench_recurrent_kda.py --batch-size 1 4 16 64 128 256
+    python benchmarks/bench_recurrent_kda.py --head-size 64 --batch-size 1 32 128
+    python benchmarks/bench_recurrent_kda.py --seq-len 1 2 3 4 --batch-size 1 32
 """
 
 import argparse
@@ -46,7 +46,7 @@ except ImportError:
 # ============================================================================
 
 
-def kda_decode_flops(
+def recurrent_kda_flops(
     batch_size: int,
     num_q_heads: int,
     _num_k_heads: int,
@@ -69,7 +69,7 @@ def kda_decode_flops(
     return total_flops
 
 
-def kda_decode_bytes(
+def recurrent_kda_bytes(
     batch_size: int,
     num_q_heads: int,
     num_k_heads: int,
@@ -121,7 +121,7 @@ def kda_decode_bytes(
 # ============================================================================
 
 
-def bench_kda_decode(
+def bench_recurrent_kda(
     batch_size: int,
     seq_len: int,
     num_q_heads: int,
@@ -182,10 +182,10 @@ def bench_kda_decode(
 
     # Calculate metrics
     kernel_median_ms = np.median(kernel_times_ms)
-    flops = kda_decode_flops(
+    flops = recurrent_kda_flops(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, seq_len
     )
-    bytes_accessed = kda_decode_bytes(
+    bytes_accessed = recurrent_kda_bytes(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, dtype, seq_len
     )
 
@@ -208,7 +208,7 @@ def bench_kda_decode(
 # ============================================================================
 
 
-def run_kda_decode_benchmark(args, dtype):
+def run_recurrent_kda_benchmark(args, dtype):
     """Run KDA decode benchmark for T=1."""
     if not KDA_DECODE_AVAILABLE:
         print("Error: KDA decode kernel is not available.")
@@ -222,7 +222,7 @@ def run_kda_decode_benchmark(args, dtype):
         return
 
     print("\n" + "=" * 100)
-    print(f"KDA Decode Benchmark (T={valid_seq_lens})")
+    print(f"Recurrent KDA Benchmark (T={valid_seq_lens})")
     print(
         f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
         f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
@@ -237,7 +237,7 @@ def run_kda_decode_benchmark(args, dtype):
     for batch_size in args.batch_size:
         for seq_len in valid_seq_lens:
             try:
-                result = bench_kda_decode(
+                result = bench_recurrent_kda(
                     batch_size=batch_size,
                     seq_len=seq_len,
                     num_q_heads=args.num_q_heads,
@@ -282,13 +282,13 @@ def run_kda_decode_benchmark(args, dtype):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="KDA Decode Benchmark",
+        description="Recurrent KDA Benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python benchmarks/bench_kda_decode.py --batch-size 1 4 16 64 128 256
-  python benchmarks/bench_kda_decode.py --head-size 64 --batch-size 1 32 128
-  python benchmarks/bench_kda_decode.py --seq-len 1 2 3 4 --batch-size 1 32
+  python benchmarks/bench_recurrent_kda.py --batch-size 1 4 16 64 128 256
+  python benchmarks/bench_recurrent_kda.py --head-size 64 --batch-size 1 32 128
+  python benchmarks/bench_recurrent_kda.py --seq-len 1 2 3 4 --batch-size 1 32
 """,
     )
     parser.add_argument(
@@ -330,7 +330,7 @@ Examples:
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
     dtype = dtype_map[args.dtype]
 
-    run_kda_decode_benchmark(args, dtype)
+    run_recurrent_kda_benchmark(args, dtype)
 
 
 if __name__ == "__main__":
