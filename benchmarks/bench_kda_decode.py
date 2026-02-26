@@ -209,16 +209,16 @@ def bench_kda_decode(
 
 
 def run_kda_decode_benchmark(args, dtype):
-    """Run KDA decode benchmark for T=1,2,3,4."""
+    """Run KDA decode benchmark for T=1."""
     if not KDA_DECODE_AVAILABLE:
         print("Error: KDA decode kernel is not available.")
-        print("Make sure flashinfer.kda_kernels.kda_decode_bf16_state is importable.")
+        print("Make sure flashinfer.kda_kernels.recurrent_kda is importable.")
         return
 
-    # Filter seq_len to only valid values (1,2,3,4)
-    valid_seq_lens = [t for t in args.seq_len if t in [1, 2, 3, 4]]
+    # Filter seq_len to only valid values (T=1 only)
+    valid_seq_lens = [t for t in args.seq_len if t == 1]
     if not valid_seq_lens:
-        print("Error: --seq-len must include values from [1, 2, 3, 4]")
+        print("Error: --seq-len must include 1 (kernel supports T=1 only)")
         return
 
     print("\n" + "=" * 100)
@@ -309,8 +309,8 @@ Examples:
         "--seq-len",
         type=int,
         nargs="+",
-        default=[1, 2, 3, 4],
-        help="Sequence lengths (T=1,2,3,4)",
+        default=[1],
+        help="Sequence length (T=1 only)",
     )
     parser.add_argument(
         "--warmup",

@@ -1101,6 +1101,9 @@ def recurrent_kda(
     assert K == V, f"K must equal V, got K={K}, V={V}"
     assert K in (64, 128), f"HEAD_DIM must be 64 or 128, got K={K}"
     assert q.dtype == torch.bfloat16, f"q must be bfloat16, got {q.dtype}"
+    assert HV >= H and HV % H == 0, (
+        f"HV must be a positive multiple of H, got H={H}, HV={HV}"
+    )
 
     if use_gate_in_kernel:
         assert A_log is not None, "A_log is required when use_gate_in_kernel=True"
@@ -1121,7 +1124,11 @@ def recurrent_kda(
             state = torch.zeros(max_idx, HV, V, K, device=device, dtype=torch.bfloat16)
         else:
             state = initial_state
-        out_buf = torch.zeros_like(v)
+        if (output is not None and output.shape == v.shape
+                and output.dtype == q.dtype and output.device == device):
+            out_buf = output
+        else:
+            out_buf = torch.empty_like(v)
     else:
         assert T == 1, f"Decode only supports T=1, got T={T}"
         cu_seqlens_i32 = None

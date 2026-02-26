@@ -85,7 +85,7 @@ def naive_kda_lowerbound_gate(
 # ==============================================================================
 
 
-def assert_close(prefix, ref, tri, atol=1e-1, rtol=5e-2):
+def assert_close(prefix, ref, tri, atol=5e-3, rtol=5e-3):
     """Assert tensors are close with bf16-appropriate tolerances."""
     ref_f, tri_f = ref.float(), tri.float()
     abs_diff = (ref_f - tri_f).flatten().abs().max().item()
