@@ -5,6 +5,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from flashinfer.utils import is_sm100a_supported
+
+if not is_sm100a_supported(torch.device("cuda")):
+    pytest.skip("Recurrent KDA requires SM100a (Blackwell)", allow_module_level=True)
+
 from flashinfer.kda_kernels import recurrent_kda
 
 try:
