@@ -36,9 +36,9 @@ from flashinfer.testing import bench_gpu_time
 try:
     from flashinfer.kda_kernels import recurrent_kda
 
-    KDA_DECODE_AVAILABLE = True
+    RECURRENT_KDA_AVAILABLE = True
 except ImportError:
-    KDA_DECODE_AVAILABLE = False
+    RECURRENT_KDA_AVAILABLE = False
 
 
 # ============================================================================
@@ -133,7 +133,7 @@ def bench_recurrent_kda(
     bench_iters: int = 100,
 ):
     """Benchmark KDA decode kernel for T=1."""
-    if not KDA_DECODE_AVAILABLE:
+    if not RECURRENT_KDA_AVAILABLE:
         raise RuntimeError("KDA decode kernel is not available")
 
     assert seq_len == 1, f"KDA decode supports T=1 only, got T={seq_len}"
@@ -210,7 +210,7 @@ def bench_recurrent_kda(
 
 def run_recurrent_kda_benchmark(args, dtype):
     """Run KDA decode benchmark for T=1."""
-    if not KDA_DECODE_AVAILABLE:
+    if not RECURRENT_KDA_AVAILABLE:
         print("Error: KDA decode kernel is not available.")
         print("Make sure flashinfer.kda_kernels.recurrent_kda is importable.")
         return
