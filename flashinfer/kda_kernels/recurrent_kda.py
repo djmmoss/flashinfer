@@ -26,6 +26,7 @@ Supports GQA (H != HV), cu_seqlens for variable-length batches, and
 compile-time gate modes (pre-computed, softplus, lower_bound * sigmoid).
 """
 
+import functools
 import math
 from typing import Optional
 
@@ -974,12 +975,12 @@ def recurrent_kda_launch(
 # PUBLIC API
 # ==============================================================================
 
-_tvm_kernels = {}  # (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS) -> compiled
 _dummy_cache = {}  # device -> dict of pre-allocated dummy tensors
 
 
-def _compile_tvm_ffi(HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS):
-    """Compile kernel with symbolic dims for TVM FFI dispatch."""
+@functools.cache
+def _get_compiled_kernel(HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS):
+    """Cache compiled kernel for given configuration."""
     B, H, HV, N = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     K, V = HEAD_DIM, HEAD_DIM
 
@@ -1012,47 +1013,6 @@ def _compile_tvm_ffi(HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS,
         options="--enable-tvm-ffi --generate-line-info",
-    )
-
-
-def _get_dummy_tensors(device):
-    """Get or create cached dummy tensors for a device."""
-    global _dummy_cache
-    if device not in _dummy_cache:
-        _dummy_cache[device] = {
-            'f32_1': torch.zeros(1, device=device, dtype=torch.float32),
-            'i32_1': torch.zeros(1, device=device, dtype=torch.int32),
-        }
-    return _dummy_cache[device]
-
-
-def _dispatch_kernel(q, k, v, g, beta, state, output, A_log, dt_bias,
-                     cu_seqlens, ssm_state_indices, scale, lower_bound,
-                     use_gate_in_kernel):
-    """Compile (if needed) and launch the TVM FFI kernel."""
-    global _tvm_kernels
-    K = q.shape[3]
-    USE_GATE = 1 if use_gate_in_kernel else 0
-    HAS_BIAS = 1 if dt_bias is not None else 0
-    USE_LB = 1 if lower_bound is not None else 0
-    USE_CU = 1 if cu_seqlens is not None else 0
-
-    dc = _get_dummy_tensors(q.device)
-    a_log = A_log if A_log is not None else dc['f32_1']
-    dt = dt_bias if dt_bias is not None else dc['f32_1']
-    cu = cu_seqlens if cu_seqlens is not None else dc['i32_1']
-    ssi = ssm_state_indices if ssm_state_indices is not None else dc['i32_1']
-
-    key = (K, USE_GATE, HAS_BIAS, USE_LB, USE_CU)
-    if key not in _tvm_kernels:
-        _tvm_kernels[key] = _compile_tvm_ffi(K, USE_GATE, HAS_BIAS, USE_LB, USE_CU)
-
-    _tvm_kernels[key](
-        q, k, v, g, beta, state, output,
-        a_log, dt, cu, ssi,
-        scale if scale is not None else 1.0 / math.sqrt(K),
-        1e-6,
-        lower_bound if lower_bound is not None else 0.0,
     )
 
 
@@ -1178,10 +1138,31 @@ def recurrent_kda(
         else:
             out_buf = torch.empty(B, 1, HV, V, device=device, dtype=q.dtype)
 
-    _dispatch_kernel(
+    # Compile kernel (cached by constexpr config)
+    USE_GATE = 1 if use_gate_in_kernel else 0
+    HAS_BIAS = 1 if dt_bias is not None else 0
+    USE_LB = 1 if lower_bound is not None else 0
+    USE_CU = 1 if cu_seqlens_i32 is not None else 0
+    compiled = _get_compiled_kernel(K, USE_GATE, HAS_BIAS, USE_LB, USE_CU)
+
+    # Dummy tensors for unused optional args (TVM FFI requires all args present)
+    global _dummy_cache
+    if device not in _dummy_cache:
+        _dummy_cache[device] = {
+            'f32_1': torch.zeros(1, device=device, dtype=torch.float32),
+            'i32_1': torch.zeros(1, device=device, dtype=torch.int32),
+        }
+    dc = _dummy_cache[device]
+
+    compiled(
         q, k, v, g, beta, state, out_buf,
-        A_log, dt_bias, cu_seqlens_i32, ssi,
-        scale, lower_bound, use_gate_in_kernel,
+        A_log if A_log is not None else dc['f32_1'],
+        dt_bias if dt_bias is not None else dc['f32_1'],
+        cu_seqlens_i32 if cu_seqlens_i32 is not None else dc['i32_1'],
+        ssi if ssi is not None else dc['i32_1'],
+        scale if scale is not None else 1.0 / math.sqrt(K),
+        1e-6,
+        lower_bound if lower_bound is not None else 0.0,
     )
 
     return out_buf, state if output_final_state else None
