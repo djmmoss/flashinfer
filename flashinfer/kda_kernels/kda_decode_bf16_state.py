@@ -13,22 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-KDA (Key-Driven Attention) Decode Kernel using CuTe-DSL
-========================================================
+Recurrent KDA (Key-Driven Attention) decode kernel using CuTe DSL for SM100.
 
-High-performance CUDA kernel implementing the KDA (Key-Driven Attention) decode
-mechanism with per-K-dimension gating, supporting sequence lengths T=1, T=2, T=3, T=4.
+Single-token (T=1) recurrent linear attention with per-key-dimension gating.
+State S[V,K] is updated via: S = diag(g_exp) @ S + beta * k * (v - S^T k)
+Output: o = S^T q
 
-Key Features:
-- Unified kernel architecture: T=2/3/4 share a single compile-time specialized kernel
-  using Constexpr dispatch, while T=1 uses a separate kernel with persistent K-in-registers
-- L2-normalized Q/K with configurable scale
-- Pre-computed log-space gate g[B,T,HV,K] and pre-sigmoided beta[B,T,HV]
-- Delta rule updates: v_delta = beta * (v - pred)
-- Bank-conflict-free cross-warp reductions
-- Async H memory loading with aggressive pipelining
-- BF16 tensors with FP32 compute for numerical stability
-- GQA (grouped-query attention) support with configurable H (query) and HV (value) heads
+Inputs:  q,k [B,1,H,K]  v,g [B,1,HV,K]  beta [B,1,HV]  state [B,HV,V,K] bf16
+Output:  o [B,1,HV,V]   state modified in-place
+
+Supports GQA (H != HV), cu_seqlens for variable-length batches, and
+compile-time gate modes (pre-computed, softplus, lower_bound * sigmoid).
 """
 
 import math
@@ -39,46 +34,274 @@ import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
 from cutlass import utils
+from cutlass._mlir.dialects import arith as mlir_arith
+from cutlass._mlir.dialects import math as mlir_math
 from cutlass._mlir.dialects import nvvm
-from cutlass.cute.runtime import from_dlpack
+import tvm_ffi  # noqa: F401 — TVM FFI required for zero-overhead kernel dispatch
 
-from flashinfer.gdn_kernels._common import (
-    H_SMEM_PADDING,
-    write_h_chunk_to_smem,
-    store_h_smem_to_gmem,
-    load_h_chunk_async,
-    normalize_and_store_qk_to_smem,
-    load_v_to_smem,
-    load_kq_chunk_from_smem,
-    update_h_with_delta,
-    compute_output,
-    cross_warp_reduce_single,
-    cross_warp_reduce_two,
-)
-
-# TVM FFI: eliminates DLPack overhead by passing torch.Tensor directly
-import importlib.util
-
-_HAS_TVM_FFI = importlib.util.find_spec("tvm_ffi") is not None
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+# SMEM H padding for bank conflict avoidance.
+# H_SMEM_STRIDE = HEAD_DIM + H_SMEM_PADDING (computed inside kernels from HEAD_DIM).
+# Constraint: (stride * 2) must have ≥16 as highest power-of-2 factor for cp.async 128-bit
+# alignment.
+#   HEAD_DIM=128: stride=136 → 272 bytes → 272 = 16*17 → align<16> ✓
+#   HEAD_DIM=64:  stride=72  → 144 bytes → 144 = 16*9  → align<16> ✓
+# Bank analysis: stride=136 and stride=72 both give 4-way conflicts (acceptable).
+H_SMEM_PADDING = 8
 
 
-# KDA-SPECIFIC FUNCTIONS (per-K gate)
+# ==============================================================================
+# SHARED HELPER FUNCTIONS
+# ==============================================================================
 
 
 @cute.jit
-def load_g_exp_chunk(g_exp_chunk, g_head, k_base):
-    """Load pre-computed log-space gate from global memory and exponentiate.
+def write_h_chunk_to_smem(h_chunk_f32, h_sh_chunk, lane_idx, k_base):
+    """Write F32 register H chunk to BF16 SMEM."""
+    for i in cutlass.range_constexpr(32):
+        h_sh_chunk[lane_idx, k_base + i] = h_chunk_f32[i].to(cutlass.BFloat16)
+
+
+@cute.jit
+def store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_offset,
+                          HEAD_DIM: cutlass.Constexpr[int]):
+    """Store H from SMEM to GMEM using 128-bit stores."""
+    copy_bits = 128
+    copy_elems = copy_bits // cutlass.BFloat16.width
+
+    from cutlass.cute.nvgpu import CopyUniversalOp
+
+    if HEAD_DIM == 64:
+        # 64 threads: use (8, 8) thread layout, (8, 64) tiles, 4 row iterations
+        thr_layout = cute.make_layout((8, 8), stride=(8, 1))
+        val_layout = cute.make_layout((1, copy_elems))
+        atom_store = cute.make_copy_atom(
+            CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=copy_bits
+        )
+        tiled_copy = cute.make_tiled_copy_tv(atom_store, thr_layout, val_layout)
+        thr_copy = tiled_copy.get_slice(tidx)
+        for row_iter in cutlass.range_constexpr(4):
+            s_tile = cute.local_tile(h_sh_chunk, (8, 64), (row_iter, 0))
+            g_tile = cute.local_tile(
+                h_out, (8, 64), (row_iter + (v_row_offset // 8), 0)
+            )
+            tS = thr_copy.partition_S(s_tile)
+            tD = thr_copy.partition_D(g_tile)
+            cute.copy(atom_store, tS, tD)
+    elif HEAD_DIM == 128:
+        # 128 threads: use (16, 8) thread layout, (16, 64) tiles, 2×2 iterations
+        thr_layout = cute.make_layout((16, 8), stride=(8, 1))
+        val_layout = cute.make_layout((1, copy_elems))
+        atom_store = cute.make_copy_atom(
+            CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=copy_bits
+        )
+        tiled_copy = cute.make_tiled_copy_tv(atom_store, thr_layout, val_layout)
+        thr_copy = tiled_copy.get_slice(tidx)
+        for row_iter in cutlass.range_constexpr(2):
+            for col_iter in cutlass.range_constexpr(2):
+                s_tile = cute.local_tile(h_sh_chunk, (16, 64), (row_iter, col_iter))
+                g_tile = cute.local_tile(
+                    h_out, (16, 64), (row_iter + (v_row_offset // 16), col_iter)
+                )
+                tS = thr_copy.partition_S(s_tile)
+                tD = thr_copy.partition_D(g_tile)
+                cute.copy(atom_store, tS, tD)
+
+
+@cute.jit
+def load_h_chunk_async(h_sh_chunk, h_global, tidx, row_offset,
+                        HEAD_DIM: cutlass.Constexpr[int]):
+    """Load H chunk from GMEM to SMEM using async copy."""
+    copy_bits = 128
+    copy_elems = copy_bits // cutlass.BFloat16.width
+
+    if HEAD_DIM == 64:
+        # 64 threads: use (8, 8) thread layout, (8, 64) tiles, 4 row iterations
+        thr_layout = cute.make_layout((8, 8), stride=(8, 1))
+        val_layout = cute.make_layout((1, copy_elems))
+        atom_async_copy = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            cutlass.BFloat16,
+            num_bits_per_copy=copy_bits,
+        )
+        tiled_copy = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
+        thr_copy = tiled_copy.get_slice(tidx)
+        for row_iter in cutlass.range_constexpr(4):
+            g_tile = cute.local_tile(
+                h_global, (8, 64), (row_iter + (row_offset // 8), 0)
+            )
+            s_tile = cute.local_tile(h_sh_chunk, (8, 64), (row_iter, 0))
+            tS = thr_copy.partition_S(g_tile)
+            tD = thr_copy.partition_D(s_tile)
+            cute.copy(atom_async_copy, tS, tD)
+    elif HEAD_DIM == 128:
+        # 128 threads: use (16, 8) thread layout, (16, 64) tiles, 2×2 iterations
+        thr_layout = cute.make_layout((16, 8), stride=(8, 1))
+        val_layout = cute.make_layout((1, copy_elems))
+        atom_async_copy = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(
+                cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+            ),
+            cutlass.BFloat16,
+            num_bits_per_copy=copy_bits,
+        )
+        tiled_copy = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
+        thr_copy = tiled_copy.get_slice(tidx)
+        for row_iter in cutlass.range_constexpr(2):
+            for col_iter in cutlass.range_constexpr(2):
+                g_tile = cute.local_tile(
+                    h_global, (16, 64), (row_iter + (row_offset // 16), col_iter)
+                )
+                s_tile = cute.local_tile(h_sh_chunk, (16, 64), (row_iter, col_iter))
+                tS = thr_copy.partition_S(g_tile)
+                tD = thr_copy.partition_D(s_tile)
+                cute.copy(atom_async_copy, tS, tD)
+
+
+
+@cute.jit
+def compute_gate_exp_chunk(g_exp_chunk, g_head, k_base,
+                            A_log_val, gDtBias, h_K_offset, lower_bound_val,
+                            USE_GATE_IN_KERNEL: cutlass.Constexpr[int],
+                            HAS_DT_BIAS: cutlass.Constexpr[int],
+                            USE_LOWER_BOUND: cutlass.Constexpr[int]):
+    """Load gate from global memory and compute exp(gate).
+
+    When USE_GATE_IN_KERNEL=0: g is pre-computed log-space gate, just exp it.
+    When USE_GATE_IN_KERNEL=1, USE_LOWER_BOUND=0:
+        g_log = -exp(A_log) * softplus(g + dt_bias); return exp(g_log)
+    When USE_GATE_IN_KERNEL=1, USE_LOWER_BOUND=1:
+        g_log = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)); return exp(g_log)
 
     Args:
         g_exp_chunk: output register tensor (32,) Float32
-        g_head: global gate tensor slice [K=HEAD_DIM], BFloat16
+        g_head: global gate tensor slice [K=HEAD_DIM]
         k_base: starting K index for this warp (warp_idx * 32)
+        A_log_val: exp(A_log) for this head (Float32), precomputed outside
+        gDtBias: dt_bias tensor [H*K] Float32 (or dummy if HAS_DT_BIAS=0)
+        h_K_offset: query_head_idx * K offset into dt_bias
+        lower_bound_val: lower bound float (negative, e.g. -5.0)
+        USE_GATE_IN_KERNEL: 0 = pre-computed gate, 1 = in-kernel gate
+        HAS_DT_BIAS: 0 = no dt_bias, 1 = add dt_bias
+        USE_LOWER_BOUND: 0 = softplus formula, 1 = lower_bound * sigmoid formula
     """
     for i in cutlass.range_constexpr(0, 32, 2):
-        g_val_0 = g_head[k_base + i].to(cutlass.Float32)
-        g_val_1 = g_head[k_base + i + 1].to(cutlass.Float32)
-        g_exp_chunk[i] = cute.exp(g_val_0, fastmath=True)
-        g_exp_chunk[i + 1] = cute.exp(g_val_1, fastmath=True)
+        g0 = g_head[k_base + i].to(cutlass.Float32)
+        g1 = g_head[k_base + i + 1].to(cutlass.Float32)
+        if USE_GATE_IN_KERNEL == 1:
+            if HAS_DT_BIAS == 1:
+                g0 = g0 + gDtBias[h_K_offset + k_base + i].to(cutlass.Float32)
+                g1 = g1 + gDtBias[h_K_offset + k_base + i + 1].to(cutlass.Float32)
+            if USE_LOWER_BOUND == 1:
+                # Fused exp(L * sigmoid(A*g)) using exp2 to eliminate LOG2_E multiplies:
+                # exp(-A*g) = exp2(-A*LOG2_E * g), exp(L*sig) = exp2(L*LOG2_E * sig)
+                LOG2_E = cutlass.Float32(1.4426950408889634)
+                neg_A_log2e = -A_log_val * LOG2_E
+                lb_log2e = lower_bound_val * LOG2_E
+                one = cutlass.Float32(1.0)
+                fm = mlir_arith.FastMathFlags.fast
+                # Inline sigmoid + outer exp as exp2 chain (all MLIR for fastmath)
+                one_ir = one.ir_value()
+                neg_A_ir = neg_A_log2e.ir_value()
+                lb_ir = lb_log2e.ir_value()
+                # exp2(-A*LOG2_E * g) = exp(-A*g)
+                ag0 = mlir_arith.mulf(neg_A_ir, g0.ir_value(), fastmath=fm)
+                ag1 = mlir_arith.mulf(neg_A_ir, g1.ir_value(), fastmath=fm)
+                exp0 = mlir_math.exp2(ag0, fastmath=fm)
+                exp1 = mlir_math.exp2(ag1, fastmath=fm)
+                # sigmoid = 1 / (1 + exp(-A*g))
+                denom0 = mlir_arith.addf(one_ir, exp0, fastmath=fm)
+                denom1 = mlir_arith.addf(one_ir, exp1, fastmath=fm)
+                sig0 = mlir_arith.divf(one_ir, denom0, fastmath=fm)
+                sig1 = mlir_arith.divf(one_ir, denom1, fastmath=fm)
+                # exp2(L*LOG2_E * sigmoid) = exp(L * sigmoid)
+                ls0 = mlir_arith.mulf(lb_ir, sig0, fastmath=fm)
+                ls1 = mlir_arith.mulf(lb_ir, sig1, fastmath=fm)
+                g0 = mlir_math.exp2(ls0, fastmath=fm)
+                g1 = mlir_math.exp2(ls1, fastmath=fm)
+            else:
+                # Fused softplus + exp using log2/exp2 to save 2 PTX ops per element:
+                # exp(-A * log(1+exp(g))) = exp2(-A * log2(1+exp(g)))
+                # (log2/exp2 pair cancels base conversion, no LN2/LOG2_E needed)
+                exp_g0 = cute.exp(g0, fastmath=True)
+                exp_g1 = cute.exp(g1, fastmath=True)
+                one = cutlass.Float32(1.0)
+                log2_0 = cute.log2(one + exp_g0, fastmath=True)
+                log2_1 = cute.log2(one + exp_g1, fastmath=True)
+                g0 = cute.exp2(-A_log_val * log2_0, fastmath=True)
+                g1 = cute.exp2(-A_log_val * log2_1, fastmath=True)
+        else:
+            g0 = cute.exp(g0, fastmath=True)
+            g1 = cute.exp(g1, fastmath=True)
+        g_exp_chunk[i] = g0
+        g_exp_chunk[i + 1] = g1
+
+
+@cute.jit
+def normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps,
+                                    HEAD_DIM: cutlass.Constexpr[int]):
+    """L2-normalize Q and K vectors, then store to shared memory."""
+    # ELEMS_PER_LANE = HEAD_DIM // 32 (2 for HD=64, 4 for HD=128)
+    q_reg = cute.make_rmem_tensor((HEAD_DIM // 32,), cutlass.Float32)
+    k_reg = cute.make_rmem_tensor((HEAD_DIM // 32,), cutlass.Float32)
+
+    for i in cutlass.range_constexpr(HEAD_DIM // 32):
+        q_reg[i] = q_head[lane_idx + i * 32].to(cutlass.Float32)
+        k_reg[i] = k_head[lane_idx + i * 32].to(cutlass.Float32)
+
+    q_sum_sq = cutlass.Float32(0.0)
+    k_sum_sq = cutlass.Float32(0.0)
+    q_sum_sq2 = cutlass.Float32(0.0)
+    k_sum_sq2 = cutlass.Float32(0.0)
+
+    for i in cutlass.range_constexpr(0, HEAD_DIM // 32, 2):
+        q_sum_sq, q_sum_sq2 = cute.arch.fma_packed_f32x2(
+            src_a=(q_reg[i], q_reg[i + 1]),
+            src_b=(q_reg[i], q_reg[i + 1]),
+            src_c=(q_sum_sq, q_sum_sq2),
+        )
+        k_sum_sq, k_sum_sq2 = cute.arch.fma_packed_f32x2(
+            src_a=(k_reg[i], k_reg[i + 1]),
+            src_b=(k_reg[i], k_reg[i + 1]),
+            src_c=(k_sum_sq, k_sum_sq2),
+        )
+
+    q_sum_sq = q_sum_sq + q_sum_sq2
+    k_sum_sq = k_sum_sq + k_sum_sq2
+
+    # Butterfly shuffle: always 5 rounds (32 lanes per warp, hardware constant)
+    for i in cutlass.range_constexpr(5):
+        q_sum_sq = q_sum_sq + cute.arch.shuffle_sync_bfly(
+            q_sum_sq, offset=1 << i, mask=0xFFFFFFFF
+        )
+        k_sum_sq = k_sum_sq + cute.arch.shuffle_sync_bfly(
+            k_sum_sq, offset=1 << i, mask=0xFFFFFFFF
+        )
+
+    q_norm = cute.rsqrt(q_sum_sq + eps, fastmath=True)
+    k_norm = cute.rsqrt(k_sum_sq + eps, fastmath=True)
+    q_scale_factor = q_norm * scale
+
+    for i in cutlass.range_constexpr(HEAD_DIM // 32):
+        q_sh[lane_idx + i * 32] = q_reg[i] * q_scale_factor
+        k_sh[lane_idx + i * 32] = k_reg[i] * k_norm
+
+
+@cute.jit
+def load_v_to_smem(v_head, v_sh, tidx):
+    """Load V values from GMEM to SMEM."""
+    v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
+
+
+@cute.jit
+def load_kq_chunk_from_smem(kq_sh, kq_chunk, k_base):
+    """Load K or Q chunk from SMEM to registers."""
+    for i in cutlass.range_constexpr(32):
+        kq_chunk[i] = kq_sh[k_base + i]
 
 
 @cute.jit
@@ -111,6 +334,32 @@ def decay_h_from_smem_and_compute_pred(
 
 
 @cute.jit
+def update_h_with_delta(h_chunk, kq_chunk, v_delta):
+    """Update H with delta: h = h + k * v_delta."""
+    for i in cutlass.range_constexpr(0, 32, 2):
+        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+            src_a=(kq_chunk[i], kq_chunk[i + 1]),
+            src_b=(v_delta, v_delta),
+            src_c=(h_chunk[i], h_chunk[i + 1]),
+        )
+
+
+@cute.jit
+def compute_output(h_chunk, kq_chunk):
+    """Compute output = sum_k(h * q)."""
+    out = cutlass.Float32(0.0)
+    out2 = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(0, 32, 2):
+        out, out2 = cute.arch.fma_packed_f32x2(
+            src_a=(h_chunk[i], h_chunk[i + 1]),
+            src_b=(kq_chunk[i], kq_chunk[i + 1]),
+            src_c=(out, out2),
+        )
+    out = out + out2
+    return out
+
+
+@cute.jit
 def decay_h_in_place(h_chunk, g_exp_chunk):
     """Apply decay to H in place: h = h * g_exp."""
     for i in cutlass.range_constexpr(0, 32, 2):
@@ -122,431 +371,65 @@ def decay_h_in_place(h_chunk, g_exp_chunk):
 
 
 @cute.jit
-def process_first_token(
-    h_sh_chunk_curr,
-    h_chunk,
-    kq_chunk,
-    g_exp_chunk,
-    k_sh,
-    q_sh,
-    v_sh,
-    reduce_sh,
-    _o_head,
-    g_head,
-    beta,
-    v_offset,
-    pred_slot,
-    warp_idx,
-    lane_idx,
-    k_base,
-    NUM_WARPS: cutlass.Constexpr[int],
-):
+def cross_warp_reduce_single(reduce_sh, slot, warp_idx, lane_idx, value,
+                              NUM_WARPS: cutlass.Constexpr[int]):
     """
-    Process the first token in a V-chunk (T=0).
-    - Load pre-computed gate from global memory
-    - Load K from SMEM
-    - Decay H from SMEM and compute pred
-    - Cross-warp reduce pred (uses pred_slot)
-    - Update H with delta
-    - Load Q and compute output
-    Returns: out (partial output, not yet reduced)
+    Cross-warp reduction for a single value using bank-conflict-free layout.
+    Layout: [slot, lane_idx, warp_idx]
     """
-    # Load pre-computed per-K gate vector from global memory
-    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
-
-    # Load K for this token
-    load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
-
-    # Decay H from SMEM and compute pred = H * K
-    pred = decay_h_from_smem_and_compute_pred(
-        h_sh_chunk_curr, h_chunk, kq_chunk, g_exp_chunk, lane_idx, k_base
-    )
-
-    # Reduce pred across warps (slot 0 for first token)
-    pred_final = cross_warp_reduce_single(
-        reduce_sh, pred_slot, warp_idx, lane_idx, pred, NUM_WARPS
-    )
-
-    # Compute delta and update H
-    v_delta = (v_sh[v_offset + lane_idx] - pred_final) * beta
-    update_h_with_delta(h_chunk, kq_chunk, v_delta)
-
-    # Load Q and compute output
-    load_kq_chunk_from_smem(q_sh, kq_chunk, k_base)
-    out = compute_output(h_chunk, kq_chunk)
-
-    return out
+    reduce_sh[slot, lane_idx, warp_idx] = value
+    cute.arch.sync_threads()
+    reduced_value = cutlass.Float32(0.0)
+    if NUM_WARPS == 2:
+        reduced_value = (
+            reduce_sh[slot, lane_idx, 0]
+            + reduce_sh[slot, lane_idx, 1]
+        )
+    elif NUM_WARPS == 4:
+        reduced_value = (
+            reduce_sh[slot, lane_idx, 0]
+            + reduce_sh[slot, lane_idx, 1]
+            + reduce_sh[slot, lane_idx, 2]
+            + reduce_sh[slot, lane_idx, 3]
+        )
+    return reduced_value
 
 
 @cute.jit
-def process_middle_token(
-    h_chunk,
-    kq_chunk,
-    g_exp_chunk,
-    k_sh,
-    q_sh,
-    v_sh,
-    reduce_sh,
-    o_head_prev,
-    g_head,
-    beta,
-    v_offset,
-    out_slot_prev,
-    pred_slot,
-    out_prev,
-    warp_idx,
-    lane_idx,
-    k_base,
-    NUM_WARPS: cutlass.Constexpr[int],
-):
+def cross_warp_reduce_two(reduce_sh, slot1, slot2, warp_idx, lane_idx, value1, value2,
+                           NUM_WARPS: cutlass.Constexpr[int]):
     """
-    Process a middle token (T=1, T=2 for T=4 kernel).
-    - Load pre-computed gate from global memory
-    - Decay H in place
-    - Load K, compute pred
-    - Joint reduction of (prev_out, this_pred)
-    - Store prev output
-    - Update H with delta
-    - Load Q and compute output
-    Returns: out (partial output, not yet reduced)
+    Cross-warp reduction for two values simultaneously using bank-conflict-free layout.
+    Layout: [slot, lane_idx, warp_idx]
     """
-    # Load pre-computed per-K gate vector from global memory
-    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
-
-    # Decay H in place
-    decay_h_in_place(h_chunk, g_exp_chunk)
-
-    # Load K and compute pred
-    load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
-    pred = compute_output(h_chunk, kq_chunk)
-
-    # Joint reduction: reduce out_prev and pred together
-    out_prev_final, pred_final = cross_warp_reduce_two(
-        reduce_sh,
-        out_slot_prev,
-        pred_slot,
-        warp_idx,
-        lane_idx,
-        out_prev,
-        pred,
-        NUM_WARPS,
-    )
-
-    # Store previous token's output
-    if warp_idx == 0:
-        o_head_prev[v_offset + lane_idx] = out_prev_final.to(cutlass.BFloat16)
-
-    # Compute delta and update H
-    v_delta = (v_sh[v_offset + lane_idx] - pred_final) * beta
-    update_h_with_delta(h_chunk, kq_chunk, v_delta)
-
-    # Load Q and compute output
-    load_kq_chunk_from_smem(q_sh, kq_chunk, k_base)
-    out = compute_output(h_chunk, kq_chunk)
-
-    return out
-
-
-@cute.jit
-def process_last_token_and_finish(
-    h_sh_chunk_curr,
-    h_chunk,
-    kq_chunk,
-    g_exp_chunk,
-    k_sh,
-    q_sh,
-    v_sh,
-    reduce_sh,
-    o_head_prev,
-    o_head_last,
-    g_head,
-    beta,
-    v_offset,
-    out_slot_prev,
-    pred_slot,
-    out_slot_last,
-    out_prev,
-    warp_idx,
-    lane_idx,
-    k_base,
-    NUM_WARPS: cutlass.Constexpr[int],
-):
-    """
-    Process the last token and finalize the V-chunk.
-    - Load pre-computed gate from global memory
-    - Decay H in place
-    - Load K, compute pred
-    - Joint reduction of (prev_out, this_pred)
-    - Store prev output
-    - Update H with delta
-    - Compute last output and reduce
-    - Write H back to SMEM
-    - Store last output
-    """
-    # Load pre-computed per-K gate vector from global memory
-    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
-
-    # Decay H in place
-    decay_h_in_place(h_chunk, g_exp_chunk)
-
-    # Load K and compute pred
-    load_kq_chunk_from_smem(k_sh, kq_chunk, k_base)
-    pred = compute_output(h_chunk, kq_chunk)
-
-    # Joint reduction: reduce out_prev and pred together
-    out_prev_final, pred_final = cross_warp_reduce_two(
-        reduce_sh,
-        out_slot_prev,
-        pred_slot,
-        warp_idx,
-        lane_idx,
-        out_prev,
-        pred,
-        NUM_WARPS,
-    )
-
-    # Store previous token's output
-    if warp_idx == 0:
-        o_head_prev[v_offset + lane_idx] = out_prev_final.to(cutlass.BFloat16)
-
-    # Compute delta and update H
-    v_delta = (v_sh[v_offset + lane_idx] - pred_final) * beta
-    update_h_with_delta(h_chunk, kq_chunk, v_delta)
-
-    # Compute last output
-    load_kq_chunk_from_smem(q_sh, kq_chunk, k_base)
-    out_last = compute_output(h_chunk, kq_chunk)
-
-    # Final reduction and store
-    out_last_final = cross_warp_reduce_single(
-        reduce_sh, out_slot_last, warp_idx, lane_idx, out_last, NUM_WARPS
-    )
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk_curr, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head_last[v_offset + lane_idx] = out_last_final.to(cutlass.BFloat16)
-
-
-# ==============================================================================
-# UNIFIED V-CHUNK PROCESSING FOR SEQLEN=2/3/4
-# ==============================================================================
-
-
-@cute.jit
-def process_vchunk_unified_234(
-    h_sh_chunk_curr,
-    h_sh_chunk_prev,
-    h_out,
-    h_chunk,
-    kq_chunk,
-    g_exp_chunk,
-    k_sh0,
-    k_sh1,
-    k_sh2,
-    k_sh3,
-    q_sh0,
-    q_sh1,
-    q_sh2,
-    q_sh3,
-    v_sh0,
-    v_sh1,
-    v_sh2,
-    v_sh3,
-    reduce_sh,
-    o_head0,
-    o_head1,
-    o_head2,
-    o_head3,
-    g_head0,
-    g_head1,
-    g_head2,
-    g_head3,
-    beta0,
-    beta1,
-    beta2,
-    beta3,
-    v_offset,
-    prev_v_offset,
-    store_prev,
-    tidx,
-    warp_idx,
-    lane_idx,
-    k_base,
-    NUM_TOKENS: cutlass.Constexpr[int],
-    HEAD_DIM: cutlass.Constexpr[int],
-):
-    """
-    Unified V-chunk processing for 2, 3, or 4 tokens using Constexpr parameter.
-
-    This function handles V-chunk processing for all multi-token cases (T=2, T=3, T=4)
-    using compile-time specialization via NUM_TOKENS.
-
-    Pattern:
-    - Token 0: First token (always)
-    - Tokens 1 to NUM_TOKENS-2: Middle tokens (compile-time unrolled)
-    - Token NUM_TOKENS-1: Last token (always)
-    """
-    # Store previous H chunk if needed
-    if store_prev:
-        store_h_smem_to_gmem(h_sh_chunk_prev, h_out, tidx, prev_v_offset, HEAD_DIM)
-
-    # Token 0: First token processing (always executed)
-    out0 = process_first_token(
-        h_sh_chunk_curr,
-        h_chunk,
-        kq_chunk,
-        g_exp_chunk,
-        k_sh0,
-        q_sh0,
-        v_sh0,
-        reduce_sh,
-        o_head0,
-        g_head0,
-        beta0,
-        v_offset,
-        0,  # pred_slot=0
-        warp_idx,
-        lane_idx,
-        k_base,
-        HEAD_DIM // 32,  # NUM_WARPS
-    )
-
-    # Compile-time dispatch based on NUM_TOKENS
-    if NUM_TOKENS == 2:
-        # For T=2: Token 1 is the last token
-        process_last_token_and_finish(
-            h_sh_chunk_curr,
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh1,
-            q_sh1,
-            v_sh1,
-            reduce_sh,
-            o_head0,
-            o_head1,
-            g_head1,
-            beta1,
-            v_offset,
-            1,
-            2,
-            3,  # out_slot_prev=1, pred_slot=2, out_slot_last=3
-            out0,
-            warp_idx,
-            lane_idx,
-            k_base,
-            HEAD_DIM // 32,  # NUM_WARPS
+    reduce_sh[slot1, lane_idx, warp_idx] = value1
+    reduce_sh[slot2, lane_idx, warp_idx] = value2
+    cute.arch.sync_threads()
+    reduced1 = cutlass.Float32(0.0)
+    reduced2 = cutlass.Float32(0.0)
+    if NUM_WARPS == 2:
+        reduced1 = (
+            reduce_sh[slot1, lane_idx, 0]
+            + reduce_sh[slot1, lane_idx, 1]
         )
-    elif NUM_TOKENS == 3:
-        # For T=3: Token 1 is middle, Token 2 is last
-        out1 = process_middle_token(
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh1,
-            q_sh1,
-            v_sh1,
-            reduce_sh,
-            o_head0,
-            g_head1,
-            beta1,
-            v_offset,
-            1,
-            2,  # out_slot_prev=1, pred_slot=2
-            out0,
-            warp_idx,
-            lane_idx,
-            k_base,
-            HEAD_DIM // 32,  # NUM_WARPS
+        reduced2 = (
+            reduce_sh[slot2, lane_idx, 0]
+            + reduce_sh[slot2, lane_idx, 1]
         )
-        process_last_token_and_finish(
-            h_sh_chunk_curr,
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh2,
-            q_sh2,
-            v_sh2,
-            reduce_sh,
-            o_head1,
-            o_head2,
-            g_head2,
-            beta2,
-            v_offset,
-            3,
-            4,
-            5,  # out_slot_prev=3, pred_slot=4, out_slot_last=5
-            out1,
-            warp_idx,
-            lane_idx,
-            k_base,
-            HEAD_DIM // 32,  # NUM_WARPS
+    elif NUM_WARPS == 4:
+        reduced1 = (
+            reduce_sh[slot1, lane_idx, 0]
+            + reduce_sh[slot1, lane_idx, 1]
+            + reduce_sh[slot1, lane_idx, 2]
+            + reduce_sh[slot1, lane_idx, 3]
         )
-    else:
-        # For T=4: Tokens 1,2 are middle, Token 3 is last
-        out1 = process_middle_token(
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh1,
-            q_sh1,
-            v_sh1,
-            reduce_sh,
-            o_head0,
-            g_head1,
-            beta1,
-            v_offset,
-            1,
-            2,  # out_slot_prev=1, pred_slot=2
-            out0,
-            warp_idx,
-            lane_idx,
-            k_base,
-            HEAD_DIM // 32,  # NUM_WARPS
+        reduced2 = (
+            reduce_sh[slot2, lane_idx, 0]
+            + reduce_sh[slot2, lane_idx, 1]
+            + reduce_sh[slot2, lane_idx, 2]
+            + reduce_sh[slot2, lane_idx, 3]
         )
-        out2 = process_middle_token(
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh2,
-            q_sh2,
-            v_sh2,
-            reduce_sh,
-            o_head1,
-            g_head2,
-            beta2,
-            v_offset,
-            3,
-            4,  # out_slot_prev=3, pred_slot=4
-            out1,
-            warp_idx,
-            lane_idx,
-            k_base,
-            HEAD_DIM // 32,  # NUM_WARPS
-        )
-        # Last token for NUM_TOKENS=4: Token 3
-        process_last_token_and_finish(
-            h_sh_chunk_curr,
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh3,
-            q_sh3,
-            v_sh3,
-            reduce_sh,
-            o_head2,
-            o_head3,
-            g_head3,
-            beta3,
-            v_offset,
-            5,
-            6,
-            7,  # out_slot_prev=5, pred_slot=6, out_slot_last=7
-            out2,
-            warp_idx,
-            lane_idx,
-            k_base,
-            HEAD_DIM // 32,  # NUM_WARPS
-        )
+    return reduced1, reduced2
 
 
 # ==============================================================================
@@ -555,22 +438,32 @@ def process_vchunk_unified_234(
 
 
 @cute.kernel
-def gated_delta_rule_decode_kernel_seqlen1(
+def recurrent_kda_decode_kernel(
     gQ: cute.Tensor,
     gK: cute.Tensor,
     gV: cute.Tensor,
-    gG: cute.Tensor,  # [B, T, HV, K] log-space gate
-    gBeta: cute.Tensor,  # [B, T, HV] pre-sigmoided
-    gH: cute.Tensor,
+    gG: cute.Tensor,       # [B, T, HV, K] log-space gate (or raw input if USE_GATE_IN_KERNEL)
+    gBeta: cute.Tensor,    # [B, T, HV] pre-sigmoided
+    gH: cute.Tensor,       # state: bf16 [B,HV,V,K] (modified in-place)
     gO: cute.Tensor,
+    gALog: cute.Tensor,    # [H] float32 (A_log per query head)
+    gDtBias: cute.Tensor,  # [H*K] float32 (dt_bias per head and K)
+    gCuSeqlens: cute.Tensor,       # [N+1] int32 — raw cu_seqlens
+    gSsmStateIndices: cute.Tensor, # [N] int32 — raw ssm_state_indices
     scale: cutlass.Float32,
     eps: cutlass.Float32,
+    lower_bound: cutlass.Float32,
     HEAD_DIM: cutlass.Constexpr[int],
+    USE_GATE_IN_KERNEL: cutlass.Constexpr[int],
+    HAS_DT_BIAS: cutlass.Constexpr[int],
+    USE_LOWER_BOUND: cutlass.Constexpr[int],
+    USE_CU_SEQLENS: cutlass.Constexpr[int],
 ):
-    """
-    Seqlen=1 kernel with persistent K optimization.
-    HEAD_DIM: 64 or 128 (compile-time). Derives NUM_WARPS = HEAD_DIM // 32,
-    NUM_V_CHUNKS = HEAD_DIM // 32, BLOCK_SIZE = HEAD_DIM.
+    """T=1 decode kernel. One CTA per (batch, head) pair.
+
+    Thread mapping: HEAD_DIM threads = (HEAD_DIM // 32) warps x 32 lanes.
+    State [V,K] tiled into V-chunks of 32 rows (2 for HD=64, 4 for HD=128).
+    K held persistently in registers across V-chunks.
     """
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -582,48 +475,64 @@ def gated_delta_rule_decode_kernel_seqlen1(
     value_head_idx = bidx % HV
     query_head_idx = value_head_idx // (HV // H)
 
+    # cu_seqlens offset computation (zero cost when USE_CU_SEQLENS=0)
+    token_offset = cutlass.Int32(0)
+    seq_idx = batch_idx
+    if USE_CU_SEQLENS == 1:
+        token_offset = gCuSeqlens[batch_idx].to(cutlass.Int32)
+        seq_idx = gSsmStateIndices[batch_idx].to(cutlass.Int32)
+
+    # Precompute gate params (guarded by Constexpr, zero cost when unused)
+    A_log_val = cutlass.Float32(0.0)
+    h_K_offset = cutlass.Int32(0)
+    lower_bound_val = lower_bound
+    if USE_GATE_IN_KERNEL == 1:
+        A_log_val = cute.exp(gALog[query_head_idx].to(cutlass.Float32), fastmath=True)
+        h_K_offset = query_head_idx * HEAD_DIM
+
     smem = utils.SmemAllocator()
 
-    # Load pre-computed gate and beta from global memory
+    # Load gate and beta from global memory
     g_head = gG[(batch_idx, 0, value_head_idx, None)]  # [K=HEAD_DIM]
     beta = gBeta[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
+    if USE_CU_SEQLENS == 1:
+        g_head = gG[(0, token_offset, value_head_idx, None)]
+        beta = gBeta[(0, token_offset, value_head_idx)].to(cutlass.Float32)
 
     # Allocate SMEM — always 4 H chunk buffers for simplicity
     # (unused ones waste ~4.5KB for HEAD_DIM=64, trivial vs SM100's 228KB)
     h_sh_chunk0 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
     h_sh_chunk1 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
     h_sh_chunk2 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
     h_sh_chunk3 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
 
     q_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
     k_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
 
-    pred_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
-    )
-    out_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
-    )
+    pred_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32)))
+    out_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32)))
 
+    # Derive state view — bf16 [V,K]
     h_global = gH[(batch_idx, value_head_idx, None, None)]
+    if USE_CU_SEQLENS == 1:
+        h_global = gH[(seq_idx, value_head_idx, None, None)]
 
-    # Launch first 2 async loads
+    warp_idx = tidx // 32
+    lane_idx = tidx % 32
+
+    # Load first 2 state chunks (async bf16 copy)
     load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0, HEAD_DIM)
     nvvm.cp_async_commit_group()
     load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32, HEAD_DIM)
@@ -632,20 +541,20 @@ def gated_delta_rule_decode_kernel_seqlen1(
     # L2 normalization
     q_head = gQ[(batch_idx, 0, query_head_idx, None)]
     k_head = gK[(batch_idx, 0, query_head_idx, None)]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
+    if USE_CU_SEQLENS == 1:
+        q_head = gQ[(0, token_offset, query_head_idx, None)]
+        k_head = gK[(0, token_offset, query_head_idx, None)]
 
     # Use shared helper for Q/K normalization (only warp 0 does the work)
     if warp_idx == 0:
-        normalize_and_store_qk_to_smem(
-            q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM
-        )
+        normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM)
 
     cute.arch.sync_threads()
 
     # Load V
     v_head = gV[(batch_idx, 0, value_head_idx, None)]
+    if USE_CU_SEQLENS == 1:
+        v_head = gV[(0, token_offset, value_head_idx, None)]
     v_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
     v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
 
@@ -665,6 +574,9 @@ def gated_delta_rule_decode_kernel_seqlen1(
 
     h_out = gH[(batch_idx, value_head_idx, None, None)]
     o_head = gO[(batch_idx, 0, value_head_idx, None)]
+    if USE_CU_SEQLENS == 1:
+        h_out = gH[(seq_idx, value_head_idx, None, None)]
+        o_head = gO[(0, token_offset, value_head_idx, None)]
 
     # ========================================================================
     # CHUNK 0
@@ -672,8 +584,10 @@ def gated_delta_rule_decode_kernel_seqlen1(
     nvvm.cp_async_wait_group(1)
     cute.arch.sync_threads()
 
-    # Load pre-computed per-K gate (same for all V-chunks since T=1)
-    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
+    # Load/compute per-K gate (same for all V-chunks since T=1)
+    compute_gate_exp_chunk(g_exp_chunk, g_head, k_base,
+                           A_log_val, gDtBias, h_K_offset, lower_bound_val,
+                           USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND)
 
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
@@ -698,7 +612,10 @@ def gated_delta_rule_decode_kernel_seqlen1(
     cute.arch.sync_threads()
     pred_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        pred_final = pred_sh[0, lane_idx] + pred_sh[1, lane_idx]
+        pred_final = (
+            pred_sh[0, lane_idx]
+            + pred_sh[1, lane_idx]
+        )
     elif HEAD_DIM == 128:
         pred_final = (
             pred_sh[0, lane_idx]
@@ -734,7 +651,10 @@ def gated_delta_rule_decode_kernel_seqlen1(
     cute.arch.sync_threads()
     out_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        out_final = out_sh[0, lane_idx] + out_sh[1, lane_idx]
+        out_final = (
+            out_sh[0, lane_idx]
+            + out_sh[1, lane_idx]
+        )
     elif HEAD_DIM == 128:
         out_final = (
             out_sh[0, lane_idx]
@@ -784,7 +704,10 @@ def gated_delta_rule_decode_kernel_seqlen1(
     cute.arch.sync_threads()
     pred_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        pred_final = pred_sh[0, lane_idx] + pred_sh[1, lane_idx]
+        pred_final = (
+            pred_sh[0, lane_idx]
+            + pred_sh[1, lane_idx]
+        )
     elif HEAD_DIM == 128:
         pred_final = (
             pred_sh[0, lane_idx]
@@ -819,7 +742,10 @@ def gated_delta_rule_decode_kernel_seqlen1(
     cute.arch.sync_threads()
     out_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        out_final = out_sh[0, lane_idx] + out_sh[1, lane_idx]
+        out_final = (
+            out_sh[0, lane_idx]
+            + out_sh[1, lane_idx]
+        )
     elif HEAD_DIM == 128:
         out_final = (
             out_sh[0, lane_idx]
@@ -985,608 +911,12 @@ def gated_delta_rule_decode_kernel_seqlen1(
 
 
 # ==============================================================================
-# SEQLEN=1 LOW-BATCH-SIZE KERNEL (1 V-chunk per CTA)
-# ==============================================================================
-
-
-@cute.kernel
-def kda_gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
-    gQ: cute.Tensor,
-    gK: cute.Tensor,
-    gV: cute.Tensor,
-    gG: cute.Tensor,  # [B, T, HV, K] log-space gate
-    gBeta: cute.Tensor,  # [B, T, HV] pre-sigmoided
-    gH: cute.Tensor,
-    gO: cute.Tensor,
-    scale: cutlass.Float32,
-    eps: cutlass.Float32,
-    HEAD_DIM: cutlass.Constexpr[int],
-):
-    """
-    Seqlen=1 kernel with 1 V-chunk (32 V rows) per CTA.
-    For T=1, batch_size <= 4: more CTAs per batch*head for better SM utilization.
-    Grid: batch_idx * HV * NUM_V_CHUNKS + value_head_idx * NUM_V_CHUNKS + v_chunk_idx.
-    HEAD_DIM: 64 or 128 (compile-time). NUM_V_CHUNKS = HEAD_DIM // 32.
-    """
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
-
-    batch_idx = bidx // (HV * (HEAD_DIM // 32))
-    remainder = bidx % (HV * (HEAD_DIM // 32))
-    value_head_idx = remainder // (HEAD_DIM // 32)
-    v_chunk_idx = remainder % (HEAD_DIM // 32)
-
-    query_head_idx = value_head_idx // (HV // H)
-    v_row_base = v_chunk_idx * 32
-
-    smem = utils.SmemAllocator()
-
-    # Load pre-computed gate and beta from global memory
-    g_head = gG[(batch_idx, 0, value_head_idx, None)]  # [K=HEAD_DIM]
-    beta = gBeta[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-
-    h_sh_chunk = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
-        byte_alignment=128,
-    )
-
-    q_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    k_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-
-    # Transposed layout for 1-chunk reduction: [lane_idx, warp_idx]
-    pred_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
-    )
-    out_sh = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((32, HEAD_DIM // 32), stride=(1, 32))
-    )
-
-    h_global = gH[(batch_idx, value_head_idx, None, None)]
-
-    load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base, HEAD_DIM)
-    nvvm.cp_async_commit_group()
-
-    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head = gK[(batch_idx, 0, query_head_idx, None)]
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(
-            q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM
-        )
-
-    cute.arch.sync_threads()
-
-    v_head = gV[(batch_idx, 0, value_head_idx, None)]
-    v_sh = smem.allocate_tensor(cutlass.Float32, 32)
-    if tidx < 32:
-        v_sh[tidx] = v_head[v_row_base + tidx].to(cutlass.Float32)
-
-    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-    k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)  # PERSISTENT K!
-    qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    # Per-K gate array
-    g_exp_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    k_base = warp_idx * 32
-
-    for i in cutlass.range_constexpr(32):
-        k_chunk[i] = k_sh[k_base + i]
-
-    h_out = gH[(batch_idx, value_head_idx, None, None)]
-    o_head = gO[(batch_idx, 0, value_head_idx, None)]
-
-    nvvm.cp_async_wait_group(0)
-    cute.arch.sync_threads()
-
-    # Load pre-computed per-K gate vector from global memory
-    load_g_exp_chunk(g_exp_chunk, g_head, k_base)
-
-    pred = cutlass.Float32(0.0)
-    pred2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(
-                h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
-                h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
-            ),
-            src_b=(g_exp_chunk[i], g_exp_chunk[i + 1]),
-            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
-        )
-    for i in cutlass.range_constexpr(0, 32, 2):
-        pred, pred2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(k_chunk[i], k_chunk[i + 1]),
-            src_c=(pred, pred2),
-        )
-    pred = pred + pred2
-
-    pred_sh[lane_idx, warp_idx] = pred
-    cute.arch.sync_threads()
-    pred_final = cutlass.Float32(0.0)
-    if HEAD_DIM == 64:
-        pred_final = pred_sh[lane_idx, 0] + pred_sh[lane_idx, 1]
-    elif HEAD_DIM == 128:
-        pred_final = (
-            pred_sh[lane_idx, 0]
-            + pred_sh[lane_idx, 1]
-            + pred_sh[lane_idx, 2]
-            + pred_sh[lane_idx, 3]
-        )
-
-    v_val = (v_sh[lane_idx] - pred_final) * beta
-
-    for i in cutlass.range_constexpr(0, 32, 2):
-        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
-            src_a=(k_chunk[i], k_chunk[i + 1]),
-            src_b=(v_val, v_val),
-            src_c=(h_chunk[i], h_chunk[i + 1]),
-        )
-
-    for i in cutlass.range_constexpr(32):
-        qk_temp[i] = q_sh[k_base + i]
-
-    out = cutlass.Float32(0.0)
-    out2 = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(0, 32, 2):
-        out, out2 = cute.arch.fma_packed_f32x2(
-            src_a=(h_chunk[i], h_chunk[i + 1]),
-            src_b=(qk_temp[i], qk_temp[i + 1]),
-            src_c=(out, out2),
-        )
-    out = out + out2
-
-    out_sh[lane_idx, warp_idx] = out
-    cute.arch.sync_threads()
-    out_final = cutlass.Float32(0.0)
-    if HEAD_DIM == 64:
-        out_final = out_sh[lane_idx, 0] + out_sh[lane_idx, 1]
-    elif HEAD_DIM == 128:
-        out_final = (
-            out_sh[lane_idx, 0]
-            + out_sh[lane_idx, 1]
-            + out_sh[lane_idx, 2]
-            + out_sh[lane_idx, 3]
-        )
-
-    write_h_chunk_to_smem(h_chunk, h_sh_chunk, lane_idx, k_base)
-    if warp_idx == 0:
-        o_head[v_row_base + lane_idx] = out_final.to(cutlass.BFloat16)
-
-    cute.arch.sync_threads()
-    store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_base, HEAD_DIM)
-
-
-# ==============================================================================
-# UNIFIED SEQLEN=2/3/4 MAIN KERNEL
-# ==============================================================================
-
-
-@cute.kernel
-def gated_delta_rule_decode_kernel_seqlen234_unified(
-    gQ: cute.Tensor,  # [B, T=2/3/4, H, K]
-    gK: cute.Tensor,  # [B, T=2/3/4, H, K]
-    gV: cute.Tensor,  # [B, T=2/3/4, HV, V]
-    gG: cute.Tensor,  # [B, T=2/3/4, HV, K] log-space gate
-    gBeta: cute.Tensor,  # [B, T=2/3/4, HV] pre-sigmoided
-    gH: cute.Tensor,  # [B, HV, V, K] - K-fast layout
-    gO: cute.Tensor,  # [B, T=2/3/4, HV, V]
-    scale: cutlass.Float32,
-    eps: cutlass.Float32,
-    NUM_TOKENS: cutlass.Constexpr[int],  # 2, 3, or 4
-    HEAD_DIM: cutlass.Constexpr[int],  # 64 or 128
-):
-    """
-    Unified kernel for Seqlen=2, Seqlen=3 and Seqlen=4 with compile-time specialization.
-    HEAD_DIM: 64 or 128 (compile-time). Derives NUM_WARPS = HEAD_DIM // 32,
-    NUM_V_CHUNKS = HEAD_DIM // 32.
-    """
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
-
-    batch_idx = bidx // HV
-    value_head_idx = bidx % HV
-    query_head_idx = value_head_idx // (HV // H)
-
-    warp_idx = tidx // 32
-    lane_idx = tidx % 32
-    k_base = warp_idx * 32
-
-    smem = utils.SmemAllocator()
-
-    # SMEM Allocation - H chunks (always 4 for simplicity)
-    h_sh_chunk0 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
-        byte_alignment=128,
-    )
-    h_sh_chunk1 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
-        byte_alignment=128,
-    )
-    h_sh_chunk2 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
-        byte_alignment=128,
-    )
-    h_sh_chunk3 = smem.allocate_tensor(
-        cutlass.BFloat16,
-        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
-        byte_alignment=128,
-    )
-
-    # Q/K buffers for tokens 0 and 1 (always needed for T>=2)
-    q_sh0 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    k_sh0 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    q_sh1 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    k_sh1 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-
-    # Q/K buffers for token 2 (only for NUM_TOKENS >= 3)
-    q_sh2 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    k_sh2 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-
-    # Q/K buffers for token 3 (only for NUM_TOKENS=4)
-    q_sh3 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    k_sh3 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-
-    # V buffers
-    v_sh0 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    v_sh1 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    v_sh2 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-    v_sh3 = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
-
-    # Bank-conflict-free reduce_sh: [slot, lane_idx, warp_idx]
-    # NUM_WARPS = HEAD_DIM // 32
-    reduce_sh = smem.allocate_tensor(
-        cutlass.Float32,
-        cute.make_layout(
-            (8, 32, HEAD_DIM // 32), stride=(32 * (HEAD_DIM // 32), HEAD_DIM // 32, 1)
-        ),
-    )
-
-    # Register allocation
-    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-    kq_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    # Transient per-K gate registers (recomputed per token per V-chunk)
-    g_exp_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
-
-    # Load gate slices for each token from global memory
-    g_head0 = gG[(batch_idx, 0, value_head_idx, None)]  # [K=HEAD_DIM]
-    g_head1 = gG[(batch_idx, 1, value_head_idx, None)]  # [K=HEAD_DIM]
-    beta0 = gBeta[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
-    beta1 = gBeta[(batch_idx, 1, value_head_idx)].to(cutlass.Float32)
-
-    g_head2 = g_head0  # default for T=2
-    beta2 = cutlass.Float32(0.0)
-    if NUM_TOKENS >= 3:
-        g_head2 = gG[(batch_idx, 2, value_head_idx, None)]
-        beta2 = gBeta[(batch_idx, 2, value_head_idx)].to(cutlass.Float32)
-
-    g_head3 = g_head0  # default for T=2,3
-    beta3 = cutlass.Float32(0.0)
-    if NUM_TOKENS == 4:
-        g_head3 = gG[(batch_idx, 3, value_head_idx, None)]
-        beta3 = gBeta[(batch_idx, 3, value_head_idx)].to(cutlass.Float32)
-
-    # Upfront H loading — load all NUM_V_CHUNKS
-    h_global = gH[(batch_idx, value_head_idx, None, None)]
-    load_h_chunk_async(h_sh_chunk0, h_global, tidx, 0, HEAD_DIM)
-    nvvm.cp_async_commit_group()
-    load_h_chunk_async(h_sh_chunk1, h_global, tidx, 32, HEAD_DIM)
-    nvvm.cp_async_commit_group()
-    if HEAD_DIM == 128:
-        load_h_chunk_async(h_sh_chunk2, h_global, tidx, 64, HEAD_DIM)
-        nvvm.cp_async_commit_group()
-        load_h_chunk_async(h_sh_chunk3, h_global, tidx, 96, HEAD_DIM)
-        nvvm.cp_async_commit_group()
-
-    # Q/K normalization
-    # With NUM_WARPS=HEAD_DIM//32 warps, assign one warp per token for the first round
-    q_head0 = gQ[(batch_idx, 0, query_head_idx, None)]
-    k_head0 = gK[(batch_idx, 0, query_head_idx, None)]
-    q_head1 = gQ[(batch_idx, 1, query_head_idx, None)]
-    k_head1 = gK[(batch_idx, 1, query_head_idx, None)]
-
-    # Round 1: warp 0 -> token 0, warp 1 -> token 1
-    if warp_idx == 0:
-        normalize_and_store_qk_to_smem(
-            q_head0, k_head0, q_sh0, k_sh0, lane_idx, scale, eps, HEAD_DIM
-        )
-    if warp_idx == 1:
-        normalize_and_store_qk_to_smem(
-            q_head1, k_head1, q_sh1, k_sh1, lane_idx, scale, eps, HEAD_DIM
-        )
-
-    if HEAD_DIM == 128:
-        # 4 warps: warp 2 -> token 2, warp 3 -> token 3 (if needed)
-        if NUM_TOKENS >= 3:
-            q_head2 = gQ[(batch_idx, 2, query_head_idx, None)]
-            k_head2 = gK[(batch_idx, 2, query_head_idx, None)]
-            if warp_idx == 2:
-                normalize_and_store_qk_to_smem(
-                    q_head2, k_head2, q_sh2, k_sh2, lane_idx, scale, eps, HEAD_DIM
-                )
-
-        if NUM_TOKENS == 4:
-            q_head3 = gQ[(batch_idx, 3, query_head_idx, None)]
-            k_head3 = gK[(batch_idx, 3, query_head_idx, None)]
-            if warp_idx == 3:
-                normalize_and_store_qk_to_smem(
-                    q_head3, k_head3, q_sh3, k_sh3, lane_idx, scale, eps, HEAD_DIM
-                )
-
-    if HEAD_DIM == 64:
-        # 2 warps: need extra round(s) for tokens 2 and 3
-        cute.arch.sync_threads()
-        if NUM_TOKENS >= 3:
-            q_head2 = gQ[(batch_idx, 2, query_head_idx, None)]
-            k_head2 = gK[(batch_idx, 2, query_head_idx, None)]
-            if warp_idx == 0:
-                normalize_and_store_qk_to_smem(
-                    q_head2, k_head2, q_sh2, k_sh2, lane_idx, scale, eps, HEAD_DIM
-                )
-
-        if NUM_TOKENS == 4:
-            q_head3 = gQ[(batch_idx, 3, query_head_idx, None)]
-            k_head3 = gK[(batch_idx, 3, query_head_idx, None)]
-            if warp_idx == 1:
-                normalize_and_store_qk_to_smem(
-                    q_head3, k_head3, q_sh3, k_sh3, lane_idx, scale, eps, HEAD_DIM
-                )
-
-    cute.arch.sync_threads()
-
-    # V loading - tokens 0, 1 always
-    v_head0 = gV[(batch_idx, 0, value_head_idx, None)]
-    v_head1 = gV[(batch_idx, 1, value_head_idx, None)]
-    load_v_to_smem(v_head0, v_sh0, tidx)
-    load_v_to_smem(v_head1, v_sh1, tidx)
-
-    # Token 2 V loading - only for NUM_TOKENS >= 3
-    if NUM_TOKENS >= 3:
-        v_head2 = gV[(batch_idx, 2, value_head_idx, None)]
-        load_v_to_smem(v_head2, v_sh2, tidx)
-
-    # Token 3 V loading - only for NUM_TOKENS = 4
-    if NUM_TOKENS == 4:
-        v_head3 = gV[(batch_idx, 3, value_head_idx, None)]
-        load_v_to_smem(v_head3, v_sh3, tidx)
-
-    # Output pointers - tokens 0, 1 always
-    h_out = gH[(batch_idx, value_head_idx, None, None)]
-    o_head0 = gO[(batch_idx, 0, value_head_idx, None)]
-    o_head1 = gO[(batch_idx, 1, value_head_idx, None)]
-
-    # Token 2 output pointer
-    o_head2 = o_head1  # Default for T=2
-    if NUM_TOKENS >= 3:
-        o_head2 = gO[(batch_idx, 2, value_head_idx, None)]
-
-    # Token 3 output pointer
-    o_head3 = o_head2  # Default for T=2,3
-    if NUM_TOKENS == 4:
-        o_head3 = gO[(batch_idx, 3, value_head_idx, None)]
-
-    # Process V-CHUNK 0
-    if HEAD_DIM == 64:
-        nvvm.cp_async_wait_group(1)
-    elif HEAD_DIM == 128:
-        nvvm.cp_async_wait_group(3)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk0,
-        h_sh_chunk0,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        g_exp_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_head0,
-        g_head1,
-        g_head2,
-        g_head3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        0,
-        0,
-        cutlass.Int32(0),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-        HEAD_DIM,
-    )
-
-    # Process V-CHUNK 1
-    if HEAD_DIM == 64:
-        nvvm.cp_async_wait_group(0)
-    elif HEAD_DIM == 128:
-        nvvm.cp_async_wait_group(2)
-    cute.arch.sync_threads()
-    process_vchunk_unified_234(
-        h_sh_chunk1,
-        h_sh_chunk0,
-        h_out,
-        h_chunk,
-        kq_chunk,
-        g_exp_chunk,
-        k_sh0,
-        k_sh1,
-        k_sh2,
-        k_sh3,
-        q_sh0,
-        q_sh1,
-        q_sh2,
-        q_sh3,
-        v_sh0,
-        v_sh1,
-        v_sh2,
-        v_sh3,
-        reduce_sh,
-        o_head0,
-        o_head1,
-        o_head2,
-        o_head3,
-        g_head0,
-        g_head1,
-        g_head2,
-        g_head3,
-        beta0,
-        beta1,
-        beta2,
-        beta3,
-        32,
-        0,
-        cutlass.Int32(1),
-        tidx,
-        warp_idx,
-        lane_idx,
-        k_base,
-        NUM_TOKENS,
-        HEAD_DIM,
-    )
-
-    if HEAD_DIM == 64:
-        # For HEAD_DIM=64: done after 2 chunks. Store chunk1 H and return.
-        cute.arch.sync_threads()
-        store_h_smem_to_gmem(h_sh_chunk1, h_out, tidx, 32, HEAD_DIM)
-
-    if HEAD_DIM == 128:
-        # Process V-CHUNK 2
-        nvvm.cp_async_wait_group(1)
-        cute.arch.sync_threads()
-        process_vchunk_unified_234(
-            h_sh_chunk2,
-            h_sh_chunk1,
-            h_out,
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh0,
-            k_sh1,
-            k_sh2,
-            k_sh3,
-            q_sh0,
-            q_sh1,
-            q_sh2,
-            q_sh3,
-            v_sh0,
-            v_sh1,
-            v_sh2,
-            v_sh3,
-            reduce_sh,
-            o_head0,
-            o_head1,
-            o_head2,
-            o_head3,
-            g_head0,
-            g_head1,
-            g_head2,
-            g_head3,
-            beta0,
-            beta1,
-            beta2,
-            beta3,
-            64,
-            32,
-            cutlass.Int32(1),
-            tidx,
-            warp_idx,
-            lane_idx,
-            k_base,
-            NUM_TOKENS,
-            HEAD_DIM,
-        )
-
-        # Process V-CHUNK 3
-        nvvm.cp_async_wait_group(0)
-        cute.arch.sync_threads()
-        process_vchunk_unified_234(
-            h_sh_chunk3,
-            h_sh_chunk2,
-            h_out,
-            h_chunk,
-            kq_chunk,
-            g_exp_chunk,
-            k_sh0,
-            k_sh1,
-            k_sh2,
-            k_sh3,
-            q_sh0,
-            q_sh1,
-            q_sh2,
-            q_sh3,
-            v_sh0,
-            v_sh1,
-            v_sh2,
-            v_sh3,
-            reduce_sh,
-            o_head0,
-            o_head1,
-            o_head2,
-            o_head3,
-            g_head0,
-            g_head1,
-            g_head2,
-            g_head3,
-            beta0,
-            beta1,
-            beta2,
-            beta3,
-            96,
-            64,
-            cutlass.Int32(1),
-            tidx,
-            warp_idx,
-            lane_idx,
-            k_base,
-            NUM_TOKENS,
-            HEAD_DIM,
-        )
-
-        # Final H store
-        cute.arch.sync_threads()
-        store_h_smem_to_gmem(h_sh_chunk3, h_out, tidx, 96, HEAD_DIM)
-
-
-# ==============================================================================
 # LAUNCH WRAPPERS
 # ==============================================================================
 
 
 @cute.jit
-def gated_delta_rule_launch_seqlen1(
+def recurrent_kda_launch(
     mQ: cute.Tensor,
     mK: cute.Tensor,
     mV: cute.Tensor,
@@ -1594,15 +924,26 @@ def gated_delta_rule_launch_seqlen1(
     mBeta: cute.Tensor,
     mH: cute.Tensor,
     mO: cute.Tensor,
+    mALog: cute.Tensor,
+    mDtBias: cute.Tensor,
+    mCuSeqlens: cute.Tensor,
+    mSsmStateIndices: cute.Tensor,
     scale: cutlass.Float32,
     eps: cutlass.Float32,
+    lower_bound: cutlass.Float32,
     stream: cuda.CUstream,
     HEAD_DIM: cutlass.Constexpr[int],
+    USE_GATE_IN_KERNEL: cutlass.Constexpr[int],
+    HAS_DT_BIAS: cutlass.Constexpr[int],
+    USE_LOWER_BOUND: cutlass.Constexpr[int],
+    USE_CU_SEQLENS: cutlass.Constexpr[int],
 ):
     batch_size = mQ.shape[0]
+    if USE_CU_SEQLENS == 1:
+        batch_size = mCuSeqlens.shape[0] - 1
     HV = mV.shape[2]
 
-    gated_delta_rule_decode_kernel_seqlen1(
+    recurrent_kda_decode_kernel(
         mQ,
         mK,
         mV,
@@ -1610,153 +951,18 @@ def gated_delta_rule_launch_seqlen1(
         mBeta,
         mH,
         mO,
+        mALog,
+        mDtBias,
+        mCuSeqlens,
+        mSsmStateIndices,
         scale,
         eps,
+        lower_bound,
         HEAD_DIM,
-    ).launch(
-        grid=[batch_size * HV, 1, 1],
-        block=[HEAD_DIM, 1, 1],
-        stream=stream,
-    )
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    mG: cute.Tensor,
-    mBeta: cute.Tensor,
-    mH: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-    HEAD_DIM: cutlass.Constexpr[int],
-):
-    """Launch LowBS-1 kernel: NUM_V_CHUNKS CTAs per (batch, value_head)."""
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    kda_gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
-        mQ,
-        mK,
-        mV,
-        mG,
-        mBeta,
-        mH,
-        mO,
-        scale,
-        eps,
-        HEAD_DIM,
-    ).launch(
-        grid=[batch_size * HV * (HEAD_DIM // 32), 1, 1],
-        block=[HEAD_DIM, 1, 1],
-        stream=stream,
-    )
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen2(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    mG: cute.Tensor,
-    mBeta: cute.Tensor,
-    mH: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-    HEAD_DIM: cutlass.Constexpr[int],
-):
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen234_unified(
-        mQ,
-        mK,
-        mV,
-        mG,
-        mBeta,
-        mH,
-        mO,
-        scale,
-        eps,
-        2,  # NUM_TOKENS=2
-        HEAD_DIM,
-    ).launch(
-        grid=[batch_size * HV, 1, 1],
-        block=[HEAD_DIM, 1, 1],
-        stream=stream,
-    )
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen3(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    mG: cute.Tensor,
-    mBeta: cute.Tensor,
-    mH: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-    HEAD_DIM: cutlass.Constexpr[int],
-):
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen234_unified(
-        mQ,
-        mK,
-        mV,
-        mG,
-        mBeta,
-        mH,
-        mO,
-        scale,
-        eps,
-        3,  # NUM_TOKENS=3
-        HEAD_DIM,
-    ).launch(
-        grid=[batch_size * HV, 1, 1],
-        block=[HEAD_DIM, 1, 1],
-        stream=stream,
-    )
-
-
-@cute.jit
-def gated_delta_rule_launch_seqlen4(
-    mQ: cute.Tensor,
-    mK: cute.Tensor,
-    mV: cute.Tensor,
-    mG: cute.Tensor,
-    mBeta: cute.Tensor,
-    mH: cute.Tensor,
-    mO: cute.Tensor,
-    scale: cutlass.Float32,
-    eps: cutlass.Float32,
-    stream: cuda.CUstream,
-    HEAD_DIM: cutlass.Constexpr[int],
-):
-    batch_size = mQ.shape[0]
-    HV = mV.shape[2]
-
-    gated_delta_rule_decode_kernel_seqlen234_unified(
-        mQ,
-        mK,
-        mV,
-        mG,
-        mBeta,
-        mH,
-        mO,
-        scale,
-        eps,
-        4,  # NUM_TOKENS=4
-        HEAD_DIM,
+        USE_GATE_IN_KERNEL,
+        HAS_DT_BIAS,
+        USE_LOWER_BOUND,
+        USE_CU_SEQLENS,
     ).launch(
         grid=[batch_size * HV, 1, 1],
         block=[HEAD_DIM, 1, 1],
@@ -1769,31 +975,21 @@ def gated_delta_rule_launch_seqlen4(
 # ==============================================================================
 
 
-class GatedDeltaRuleKernel:
+class RecurrentKDAKernel:
     """
-    Gated Delta Rule Kernel for linear attention decode.
+    Recurrent KDA Kernel for linear attention decode (T=1 only).
 
     Args:
-        seq_len: Sequence length (1, 2, 3, or 4)
         head_dim: Head dimension (64 or 128)
     """
 
-    def __init__(self, seq_len: int, head_dim: int = 128):
-        assert seq_len in [1, 2, 3, 4], f"Supported seq_len: 1,2,3,4, got {seq_len}"
+    def __init__(self, head_dim: int = 128):
         assert head_dim in [64, 128], f"Supported head_dim: 64,128, got {head_dim}"
-        self.seq_len = seq_len
         self.head_dim = head_dim
         self._compiled_kernel = None
 
     def _get_launch_fn(self):
-        if self.seq_len == 1:
-            return gated_delta_rule_launch_seqlen1
-        elif self.seq_len == 2:
-            return gated_delta_rule_launch_seqlen2
-        elif self.seq_len == 3:
-            return gated_delta_rule_launch_seqlen3
-        else:
-            return gated_delta_rule_launch_seqlen4
+        return recurrent_kda_launch
 
 
 # ==============================================================================
@@ -1801,254 +997,371 @@ class GatedDeltaRuleKernel:
 # ==============================================================================
 
 # ==============================================================================
-# TVM FFI COMPILATION (zero DLPack overhead)
+# TVM FFI COMPILATION
 # ==============================================================================
 
-_tvm_kernels = {}  # Cache: (T, HEAD_DIM, use_lowbs) -> compiled TVM FFI kernel
+_tvm_kernels = {}  # Cache: (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS) -> compiled
+_dummy_cache = {}  # Cache: device -> dict of pre-allocated dummy tensors
 
 
-def _compile_tvm_ffi(T, launch_fn, HEAD_DIM):
+def _compile_tvm_ffi(launch_fn, HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS):
     """Compile kernel with fake tensors and symbolic dims for TVM FFI dispatch.
 
-    Uses cute.sym_int() for B, H, HV so we compile once per (T, HEAD_DIM).
-    At runtime, torch.Tensor objects are passed directly — no from_dlpack() needed.
+    Uses cute.sym_int() for dynamic dims (B, H, HV, N, HV_state, etc.) so we
+    compile once per (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS).
     """
     B_sym = cute.sym_int()
     H_sym = cute.sym_int()
     HV_sym = cute.sym_int()
     K, V = HEAD_DIM, HEAD_DIM
+    # Separate symbolic dim for state batch — in cu_seqlens mode,
+    # q.shape[0]=1 but state.shape[0]=N (number of sequences)
+    N_sym = cute.sym_int()
 
     def make_fake(shape, dtype=cute.BFloat16):
         ndim = len(shape)
         return cute.runtime.make_fake_compact_tensor(
-            dtype,
-            shape,
-            assumed_align=32,
+            dtype, shape, assumed_align=32,
             stride_order=tuple(reversed(range(ndim))),  # row-major
         )
 
-    q_fake = make_fake((B_sym, T, H_sym, K))
-    k_fake = make_fake((B_sym, T, H_sym, K))
-    v_fake = make_fake((B_sym, T, HV_sym, V))
-    g_fake = make_fake((B_sym, T, HV_sym, K))
-    beta_fake = make_fake((B_sym, T, HV_sym))
-    h_fake = make_fake((B_sym, HV_sym, V, K))
-    o_fake = make_fake((B_sym, T, HV_sym, V))
+    # In cu_seqlens mode, T dim of Q/K/V/G/Beta/O is total_tokens (symbolic)
+    T_dim = cute.sym_int() if USE_CU_SEQLENS == 1 else 1
+    q_fake = make_fake((B_sym, T_dim, H_sym, K))
+    k_fake = make_fake((B_sym, T_dim, H_sym, K))
+    v_fake = make_fake((B_sym, T_dim, HV_sym, V))
+    g_fake = make_fake((B_sym, T_dim, HV_sym, K))
+    beta_fake = make_fake((B_sym, T_dim, HV_sym))
+    # State uses N_sym (separate from B_sym) so cu_seqlens mode works
+    # when q.shape[0] != state.shape[0]
+    HV_state = cute.sym_int()
+    h_fake = make_fake((N_sym, HV_state, V, K))
+    o_fake = make_fake((B_sym, T_dim, HV_sym, V))
+    ALog_sym = cute.sym_int()  # separate from H_sym to allow dummy tensors
+    HK_sym = cute.sym_int()   # H*K, separate symbolic dim
+    alog_fake = make_fake((ALog_sym,), dtype=cute.Float32)
+    dtbias_fake = make_fake((HK_sym,), dtype=cute.Float32)
+    # cu_seqlens [N+1] and ssm_state_indices [N] need separate symbolic dims
+    CuSeqlens_sym = cute.sym_int()
+    SsiB_sym = cute.sym_int()
+    cu_seqlens_fake = make_fake((CuSeqlens_sym,), dtype=cute.Int32)
+    ssm_state_indices_fake = make_fake((SsiB_sym,), dtype=cute.Int32)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     return cute.compile(
         launch_fn,
-        q_fake,
-        k_fake,
-        v_fake,
-        g_fake,
-        beta_fake,
-        h_fake,
-        o_fake,
+        q_fake, k_fake, v_fake, g_fake, beta_fake, h_fake, o_fake,
+        alog_fake, dtbias_fake,
+        cu_seqlens_fake, ssm_state_indices_fake,
         cutlass.Float32(0.0),  # scale placeholder
         cutlass.Float32(0.0),  # eps placeholder
+        cutlass.Float32(0.0),  # lower_bound placeholder
         stream,
         HEAD_DIM,
+        USE_GATE_IN_KERNEL,
+        HAS_DT_BIAS,
+        USE_LOWER_BOUND,
+        USE_CU_SEQLENS,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
 
-# ==============================================================================
-# DLPACK DISPATCH (fallback when TVM FFI not available)
-# ==============================================================================
-
-_compiled_kernels = {}  # Cache: (T, B, H, HV, HEAD_DIM) -> compiled kernel
-_cached_scale = {}  # Cache: scale_value -> cutlass.Float32
-_cached_eps = None  # Cached epsilon constant
-_cached_stream = None  # Cached CUstream (same stream reused)
-_cached_stream_handle = None  # Track which CUDA stream handle we cached
-
-
-def _gated_delta_rule_dlpack(
+def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
     initial_state_source: torch.Tensor,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = True,
+    use_gate_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    global _compiled_kernels, _cached_scale, _cached_eps
-    global _cached_stream, _cached_stream_handle
-
-    assert use_qk_l2norm_in_kernel, (
-        "KDA kernel always L2-normalizes Q/K; use_qk_l2norm_in_kernel=False is not supported"
-    )
-
-    B, T, H, K = q.shape
-    assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
-    HV = v.shape[2]
-    V = v.shape[3]
-    HEAD_DIM = K
-    assert K == V, f"K must equal V, got K={K}, V={V}"
-    assert HEAD_DIM in [64, 128], f"Supported HEAD_DIM: 64,128, got {HEAD_DIM}"
-    assert g.shape == (B, T, HV, K), f"g must be [B, T, HV, K], got {g.shape}"
-    assert beta.shape == (B, T, HV), f"beta must be [B, T, HV], got {beta.shape}"
-
-    if scale is None:
-        scale = 1.0 / math.sqrt(K)
-
-    output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
-
-    q_ = from_dlpack(q, assumed_align=32)
-    k_ = from_dlpack(k, assumed_align=32)
-    v_ = from_dlpack(v, assumed_align=32)
-    g_ = from_dlpack(g, assumed_align=32)
-    beta_ = from_dlpack(beta, assumed_align=32)
-    h_ = from_dlpack(initial_state_source, assumed_align=32)
-    o_ = from_dlpack(output, assumed_align=32)
-
-    # Cache scalar constants (cutlass.Float32 construction is expensive)
-    if scale not in _cached_scale:
-        _cached_scale[scale] = cutlass.Float32(scale)
-    scale_f32 = _cached_scale[scale]
-
-    if _cached_eps is None:
-        _cached_eps = cutlass.Float32(1e-6)
-    eps_f32 = _cached_eps
-
-    # Cache CUstream object (reuse when same CUDA stream)
-    current_handle = torch.cuda.current_stream().cuda_stream
-    if _cached_stream_handle != current_handle:
-        _cached_stream = cuda.CUstream(current_handle)
-        _cached_stream_handle = current_handle
-    stream = _cached_stream
-
-    # Check cache — key includes all shape dimensions to avoid incorrect reuse
-    cache_key = (T, B, H, HV, HEAD_DIM)
-    if cache_key not in _compiled_kernels:
-        # Select and compile the appropriate kernel
-        if T == 1 and B <= 4:
-            launch_fn = gated_delta_rule_launch_seqlen1_lowBS_1chunk
-        elif T == 1:
-            launch_fn = gated_delta_rule_launch_seqlen1
-        elif T == 2:
-            launch_fn = gated_delta_rule_launch_seqlen2
-        elif T == 3:
-            launch_fn = gated_delta_rule_launch_seqlen3
-        else:  # T == 4
-            launch_fn = gated_delta_rule_launch_seqlen4
-
-        _compiled_kernels[cache_key] = cute.compile(
-            launch_fn,
-            q_,
-            k_,
-            v_,
-            g_,
-            beta_,
-            h_,
-            o_,
-            scale_f32,
-            eps_f32,
-            stream,
-            HEAD_DIM,
-            options="--generate-line-info",
-        )
-
-    # Execute
-    _compiled_kernels[cache_key](
-        q_,
-        k_,
-        v_,
-        g_,
-        beta_,
-        h_,
-        o_,
-        scale_f32,
-        eps_f32,
-        stream,
-    )
-
-    return output
-
-
-def kda_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state_source: torch.Tensor,
-    scale: Optional[float] = None,
-    use_qk_l2norm_in_kernel: bool = True,
-) -> torch.Tensor:
-    """
-    KDA (Key-Driven Attention) decode kernel with per-K-dimension gating.
-
-    Implements the KDA decode mechanism with per-K-dimension gating,
-    supporting sequence lengths T=1, T=2, T=3, T=4 and HEAD_DIM 64 or 128.
+    r"""
+    Low-level kernel dispatch. Compiles and launches the CuTe DSL kernel
+    via TVM FFI. State is modified in-place.
 
     Args:
-        q: Query tensor [B, T, H, K] where K=HEAD_DIM (64 or 128)
-        k: Key tensor [B, T, H, K]
-        v: Value tensor [B, T, HV, V] where V=HEAD_DIM
-        g: Pre-computed log-space gate [B, T, HV, K]
-        beta: Pre-sigmoided beta [B, T, HV]
-        initial_state_source: H state [B, HV, V, K] (K-fast layout), modified in-place
-        scale: Optional attention scale (default: 1/sqrt(K))
-        use_qk_l2norm_in_kernel: Whether to L2-normalize Q/K in kernel (default: True)
+        q (torch.Tensor):
+            queries of shape `[B, 1, H, K]` where `K` is HEAD_DIM (64 or 128).
+        k (torch.Tensor):
+            keys of shape `[B, 1, H, K]`.
+        v (torch.Tensor):
+            values of shape `[B, 1, HV, V]` where `V` = HEAD_DIM.
+            GQA is applied when `HV != H`.
+        g (torch.Tensor):
+            gates of shape `[B, 1, HV, K]`.
+            Log-space if pre-computed, raw input if ``use_gate_in_kernel=True``.
+        beta (torch.Tensor):
+            pre-sigmoided learning rates of shape `[B, 1, HV]`.
+        initial_state_source (torch.Tensor):
+            state of shape `[B, HV, V, K]` in bf16. **Modified in-place**.
+        A_log (Optional[torch.Tensor]):
+            log gate parameter of shape `[H]` in float32.
+            Required when ``use_gate_in_kernel=True``. Default: ``None``.
+        dt_bias (Optional[torch.Tensor]):
+            per-head-K bias of shape `[H*K]` in float32. Default: ``None``.
+        scale (Optional[float]):
+            scale factor for attention scores.
+            If not provided, defaults to `1 / sqrt(K)`. Default: ``None``.
+        use_qk_l2norm_in_kernel (bool):
+            whether to L2-normalize Q and K in the kernel. Default: ``True``.
+        use_gate_in_kernel (bool):
+            whether to compute the gate inside the kernel from ``A_log`` and ``g``.
+            Default: ``False``.
+        lower_bound (Optional[float]):
+            if set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
+            gate formula. Default: ``None``.
+        cu_seqlens (Optional[torch.Tensor]):
+            cumulative sequence lengths of shape `[N+1]` in int32.
+        ssm_state_indices (Optional[torch.Tensor]):
+            state cache indices of shape `[N]` in int32.
+        output (Optional[torch.Tensor]):
+            pre-allocated output buffer of shape `[B, 1, HV, V]`.
 
     Returns:
-        output: [B, T, HV, V]
+        output (torch.Tensor):
+            output of shape `[B, 1, HV, V]`.
     """
-    assert use_qk_l2norm_in_kernel, (
-        "KDA kernel always L2-normalizes Q/K; use_qk_l2norm_in_kernel=False is not supported"
-    )
-
-    if not _HAS_TVM_FFI:
-        return _gated_delta_rule_dlpack(
-            q, k, v, g, beta, initial_state_source, scale, use_qk_l2norm_in_kernel
-        )
+    USE_GATE_IN_KERNEL = 1 if use_gate_in_kernel else 0
+    HAS_DT_BIAS = 1 if dt_bias is not None else 0
+    USE_LOWER_BOUND = 1 if lower_bound is not None else 0
+    USE_CU_SEQLENS = 1 if cu_seqlens is not None else 0
 
     global _tvm_kernels
 
-    B, T, H, K = q.shape
-    assert T in [1, 2, 3, 4], f"Supported T=1,2,3,4, got T={T}"
+    H, K = q.shape[2], q.shape[3]
     HV = v.shape[2]
     V = v.shape[3]
     HEAD_DIM = K
     assert K == V, f"K must equal V, got K={K}, V={V}"
     assert HEAD_DIM in [64, 128], f"Supported HEAD_DIM: 64,128, got {HEAD_DIM}"
-    assert g.shape == (B, T, HV, K), f"g must be [B, T, HV, K], got {g.shape}"
-    assert beta.shape == (B, T, HV), f"beta must be [B, T, HV], got {beta.shape}"
+
+    # Cached dummy tensors — allocated once per device, reused every call
+    global _dummy_cache
+    dev = q.device
+    if dev not in _dummy_cache:
+        _dummy_cache[dev] = {
+            'f32_1': torch.zeros(1, device=dev, dtype=torch.float32),
+            'i32_1': torch.zeros(1, device=dev, dtype=torch.int32),
+        }
+    _dc = _dummy_cache[dev]
+
+    if A_log is None:
+        A_log = _dc['f32_1']
+    if dt_bias is None:
+        dt_bias = _dc['f32_1']
+    if cu_seqlens is None:
+        cu_seqlens = _dc['i32_1']
+    if ssm_state_indices is None:
+        ssm_state_indices = _dc['i32_1']
+
+    lower_bound_f = lower_bound if lower_bound is not None else 0.0
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
-    output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
+    if output is None:
+        output = torch.empty(q.shape[0], 1, HV, V, device=dev, dtype=q.dtype)
 
-    # Use lowBS variant for T=1, B<=4 (more CTAs for better SM utilization)
-    use_lowbs = T == 1 and B <= 4
-    cache_key = (T, HEAD_DIM, use_lowbs)
+    cache_key = (HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS)
     if cache_key not in _tvm_kernels:
-        if use_lowbs:
-            launch_fn = gated_delta_rule_launch_seqlen1_lowBS_1chunk
-        else:
-            launch_fn = {
-                1: gated_delta_rule_launch_seqlen1,
-                2: gated_delta_rule_launch_seqlen2,
-                3: gated_delta_rule_launch_seqlen3,
-                4: gated_delta_rule_launch_seqlen4,
-            }[T]
-        _tvm_kernels[cache_key] = _compile_tvm_ffi(T, launch_fn, HEAD_DIM)
+        launch_fn = recurrent_kda_launch
+        _tvm_kernels[cache_key] = _compile_tvm_ffi(
+            launch_fn, HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS
+        )
 
-    # Direct torch tensor passing — no DLPack, no scalar wrapping, no stream
+    # Direct torch tensor passing via TVM FFI
     _tvm_kernels[cache_key](
-        q,
-        k,
-        v,
-        g,
-        beta,
-        initial_state_source,
-        output,
-        scale,
-        1e-6,
+        q, k, v, g, beta, initial_state_source, output,
+        A_log, dt_bias,
+        cu_seqlens, ssm_state_indices,
+        scale, 1e-6, lower_bound_f,
     )
 
     return output
+
+
+# ==============================================================================
+# HIGH-LEVEL WRAPPER (fla-compatible API)
+# ==============================================================================
+
+
+
+def cutedsl_kda_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+    use_gate_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    r"""
+    fla-compatible wrapper for the CuTe DSL recurrent KDA decode kernel.
+
+    Handles state allocation/zero-init, cu_seqlens preparation, and
+    output_final_state. Delegates to :func:`recurrent_kda` for kernel dispatch.
+
+    Args:
+        q (torch.Tensor):
+            queries of shape `[B, 1, H, K]`, or `[1, total_tokens, H, K]`
+            when using ``cu_seqlens``.
+        k (torch.Tensor):
+            keys of shape `[B, 1, H, K]`.
+        v (torch.Tensor):
+            values of shape `[B, 1, HV, V]`.
+            GQA is applied when `HV != H`.
+        g (torch.Tensor):
+            gates of shape `[B, 1, HV, K]`.
+        beta (torch.Tensor):
+            pre-sigmoided learning rates of shape `[B, 1, HV]`.
+        A_log (Optional[torch.Tensor]):
+            log gate parameter of shape `[H]` in float32. Default: ``None``.
+        dt_bias (Optional[torch.Tensor]):
+            per-head-K bias of shape `[H*K]` in float32. Default: ``None``.
+        scale (Optional[float]):
+            scale factor for attention scores.
+            If not provided, defaults to `1 / sqrt(K)`. Default: ``None``.
+        initial_state (Optional[torch.Tensor]):
+            initial state of shape `[N, HV, V, K]` in bf16 for `N` input sequences.
+            For equal-length input sequences, `N` equals the batch size `B`.
+            Default: ``None`` (zero-initialized).
+        output_final_state (bool):
+            whether to return the final state. Default: ``False``.
+        use_qk_l2norm_in_kernel (bool):
+            whether to L2-normalize Q and K in the kernel. Default: ``True``.
+        use_gate_in_kernel (bool):
+            whether to compute the gate inside the kernel from ``A_log`` and ``g``.
+            Default: ``False``.
+        lower_bound (Optional[float]):
+            if set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
+            gate formula. Default: ``None``.
+        cu_seqlens (Optional[torch.Tensor]):
+            cumulative sequence lengths of shape `[N+1]` in int32, consistent with
+            the FlashAttention API. Default: ``None``.
+        ssm_state_indices (Optional[torch.Tensor]):
+            state cache indices of shape `[N]` in int32, for non-contiguous state
+            access (e.g. paged KV cache). Default: ``None``.
+        output (Optional[torch.Tensor]):
+            pre-allocated output buffer of shape `[B, 1, HV, V]`.
+
+    Returns:
+        o (torch.Tensor):
+            output of shape `[B, 1, HV, V]`.
+        final_state (torch.Tensor):
+            final state of shape `[N, HV, V, K]` if ``output_final_state=True``
+            else ``None``.
+
+    Note:
+        - Requires SM100 (Blackwell) architecture
+        - State is bf16 `[N, HV, V, K]` and updated in-place
+        - HEAD_DIM (K=V) must be 64 or 128
+        - When using ``cu_seqlens``, batch size `B` must be 1
+
+    Examples::
+        >>> import torch
+        >>> from flashinfer.kda_kernels import cutedsl_kda_decode
+        # batched decode
+        >>> B, H, HV, K, V = 4, 4, 8, 128, 128
+        >>> q = torch.randn(B, 1, H, K, device='cuda', dtype=torch.bfloat16)
+        >>> k = torch.randn(B, 1, H, K, device='cuda', dtype=torch.bfloat16)
+        >>> v = torch.randn(B, 1, HV, V, device='cuda', dtype=torch.bfloat16)
+        >>> g = torch.randn(B, 1, HV, K, device='cuda', dtype=torch.bfloat16)
+        >>> beta = torch.rand(B, 1, HV, device='cuda', dtype=torch.bfloat16).sigmoid()
+        >>> h0 = torch.randn(B, HV, V, K, device='cuda', dtype=torch.bfloat16)
+        >>> o, ht = cutedsl_kda_decode(q, k, v, g, beta, initial_state=h0, output_final_state=True)
+        # variable-length decode with cu_seqlens
+        >>> cu_seqlens = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device='cuda')
+        >>> q_flat = q.reshape(1, B, H, K)
+        >>> k_flat = k.reshape(1, B, H, K)
+        >>> v_flat = v.reshape(1, B, HV, V)
+        >>> g_flat = g.reshape(1, B, HV, K)
+        >>> beta_flat = beta.reshape(1, B, HV)
+        >>> o_var, ht_var = cutedsl_kda_decode(
+        ...     q_flat, k_flat, v_flat, g_flat, beta_flat,
+        ...     initial_state=h0, output_final_state=True, cu_seqlens=cu_seqlens
+        ... )
+    """
+    # --- Validate inputs ---
+    B, T, H, K = q.shape
+    _, _, HV, V = v.shape
+    assert K == V, f"K must equal V, got K={K}, V={V}"
+    assert K in (64, 128), f"HEAD_DIM must be 64 or 128, got K={K}"
+    assert q.dtype == torch.bfloat16, f"q must be bfloat16, got {q.dtype}"
+
+    device = q.device
+
+    if use_gate_in_kernel:
+        assert A_log is not None, "A_log is required when use_gate_in_kernel=True"
+        assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+    if lower_bound is not None:
+        assert use_gate_in_kernel, "lower_bound requires use_gate_in_kernel=True"
+
+    # --- Prepare cu_seqlens / state ---
+    if cu_seqlens is not None:
+        if B != 1:
+            raise ValueError(
+                f"Batch size must be 1 when using cu_seqlens, got B={B}. "
+                f"Flatten variable-length inputs before processing."
+            )
+        N = cu_seqlens.shape[0] - 1
+        cu_seqlens_i32 = cu_seqlens.to(torch.int32)
+        ssi = ssm_state_indices.to(torch.int32) if ssm_state_indices is not None else \
+            torch.arange(N, dtype=torch.int32, device=device)
+
+        if initial_state is None:
+            max_idx = int(ssi.max().item()) + 1 if N > 0 else N
+            state = torch.zeros(max_idx, HV, V, K, device=device, dtype=torch.bfloat16)
+        else:
+            state = initial_state
+        out_buf = torch.zeros_like(v)
+    else:
+        assert T == 1, f"Decode only supports T=1, got T={T}"
+        cu_seqlens_i32 = None
+        ssi = None
+
+        if initial_state is None:
+            state = torch.zeros(B, HV, V, K, device=device, dtype=torch.bfloat16)
+        elif ssm_state_indices is not None:
+            state = initial_state[ssm_state_indices].contiguous()
+        else:
+            state = initial_state.contiguous()
+
+        if (output is not None and output.shape == (B, 1, HV, V)
+                and output.dtype == q.dtype and output.device == device):
+            out_buf = output
+        else:
+            out_buf = torch.empty(B, 1, HV, V, device=device, dtype=q.dtype)
+
+    # --- Dispatch kernel ---
+    recurrent_kda(
+        q=q, k=k, v=v, g=g, beta=beta,
+        initial_state_source=state,
+        A_log=A_log, dt_bias=dt_bias,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens_i32,
+        ssm_state_indices=ssi,
+        output=out_buf,
+    )
+
+    final_state = state if output_final_state else None
+    return out_buf, final_state

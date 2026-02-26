@@ -992,7 +992,7 @@ def gated_delta_rule_decode_pretranspose(
         - Requires SM90 (Hopper) architecture
         - State is updated in-place
         - State layout is v-major (K-last): [B, HV, V, K]. When state is bfloat16
-          and T in 1..4 with K=V in {64,128}, the gdn_decode_klast_bf16_state kernel is used.
+          and T in 1..4 with K=V=128, the gdn_decode_klast_bf16_state kernel is used.
         - Legacy path (float32 state, T=1): K and V must be multiples of 4.
     """
     # Validate input shapes
@@ -1004,13 +1004,13 @@ def gated_delta_rule_decode_pretranspose(
         f"Expected state shape [B={B}, HV={HV}, V={V}, K={K}], got {state.shape}"
     )
 
-    # Backend: gdn_decode_klast_bf16_state when bf16 state, T<=4, K-last layout, K=V in {64,128}
+    # Backend: gdn_decode_klast_bf16_state when bf16 state, T<=4, K-last layout, K=V=128
     use_gdn_decode_klast_bf16_state = (
         _GDN_DECODE_KLAST_BF16_STATE_AVAILABLE
         and state.dtype == torch.bfloat16
         and T in (1, 2, 3, 4)
-        and K == V
-        and K in (64, 128)
+        and K == 128
+        and V == 128
     )
     if use_gdn_decode_klast_bf16_state:
         assert q.dtype in (torch.float16, torch.bfloat16), (

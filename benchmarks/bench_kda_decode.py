@@ -35,7 +35,7 @@ from flashinfer.testing import bench_gpu_time
 # Import the KDA decode kernel
 try:
     from flashinfer.kda_kernels.kda_decode_bf16_state import (
-        kda_gated_delta_rule as kda_decode,
+        recurrent_kda as kda_decode,
     )
 
     KDA_DECODE_AVAILABLE = True
@@ -134,11 +134,11 @@ def bench_kda_decode(
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
-    """Benchmark KDA decode kernel for T=1,2,3,4."""
+    """Benchmark KDA decode kernel for T=1."""
     if not KDA_DECODE_AVAILABLE:
         raise RuntimeError("KDA decode kernel is not available")
 
-    assert seq_len in [1, 2, 3, 4], f"KDA decode supports T=1,2,3,4, got T={seq_len}"
+    assert seq_len == 1, f"KDA decode supports T=1 only, got T={seq_len}"
 
     # Create inputs
     T = seq_len

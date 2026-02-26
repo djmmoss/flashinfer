@@ -22,32 +22,29 @@ Per-K-dimension gating variant of GDN. Gate g[B,T,HV,K] applied per-lane
 instead of GDN's scalar broadcast.
 
 Exported Kernels:
-- kda_gated_delta_rule: KDA BF16 hidden state decode kernel (T=1,2,3,4)
-- GatedDeltaRuleKernel: Kernel class for advanced usage
-- cutedsl_kda_decode: chunk_kda-compatible wrapper
+- recurrent_kda: Low-level KDA decode kernel dispatch (T=1)
+- cutedsl_kda_decode: fla-compatible wrapper with state management
+- RecurrentKDAKernel: Kernel class for advanced usage
 """
 
 from typing import Optional, Type
 
 try:
     from .kda_decode_bf16_state import (
-        kda_gated_delta_rule,
-        GatedDeltaRuleKernel,
+        recurrent_kda,
+        cutedsl_kda_decode,
+        RecurrentKDAKernel,
     )
 
     _has_cute_dsl = True
 except ImportError:
     _has_cute_dsl = False
-    kda_gated_delta_rule = None  # type: ignore
-    GatedDeltaRuleKernel: Optional[Type] = None  # type: ignore
-
-try:
-    from .cutedsl_kda_decode import cutedsl_kda_decode
-except ImportError:
+    recurrent_kda = None  # type: ignore
     cutedsl_kda_decode = None  # type: ignore
+    RecurrentKDAKernel: Optional[Type] = None  # type: ignore
 
 __all__ = [
-    "kda_gated_delta_rule",
-    "GatedDeltaRuleKernel",
+    "recurrent_kda",
     "cutedsl_kda_decode",
+    "RecurrentKDAKernel",
 ]

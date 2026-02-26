@@ -785,7 +785,7 @@ def _test_gdn_decode_klast_bf16_state_kernel(
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", ["auto"])  # Use 1/sqrt(K) like compare_flashinfer.py
 @pytest.mark.parametrize("seq_len", [1, 2, 3, 4])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
@@ -823,7 +823,7 @@ def test_gdn_decode_klast_bf16_state_kernel(
 
 @pytest.mark.parametrize("seq_len", [1, 2, 3, 4])
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
@@ -837,7 +837,7 @@ def test_pretranspose_api_uses_gdn_decode_klast_bf16_state(
     seq_len: int,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
-    """Verify gated_delta_rule_decode_pretranspose dispatches to gdn_decode_klast_bf16_state when state is bf16 and T<=4, K=V in {64,128}.
+    """Verify gated_delta_rule_decode_pretranspose dispatches to gdn_decode_klast_bf16_state when state is bf16 and T<=4, K=V=128.
 
     Calls the API with bf16 state and checks output/state match the direct gdn_decode_klast_bf16_state call.
     """
