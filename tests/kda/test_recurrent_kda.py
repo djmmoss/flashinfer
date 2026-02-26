@@ -9,6 +9,7 @@ from flashinfer.kda_kernels import recurrent_kda
 
 try:
     from fla.ops.kda import fused_recurrent_kda
+
     _has_fla = True
 except ImportError:
     _has_fla = False
@@ -32,7 +33,7 @@ def naive_recurrent_kda(
     dtype = v.dtype
     B, T, H, K, V = *q.shape, v.shape[-1]
     if scale is None:
-        scale = K ** -0.5
+        scale = K**-0.5
 
     q, k, v, g, beta = map(lambda x: x.to(torch.float), [q, k, v, g, beta])
     q = q * scale
@@ -44,8 +45,12 @@ def naive_recurrent_kda(
     for i in range(0, T):
         q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
         S = S * g_i[..., None].exp()
-        S = S + torch.einsum('b h k, b h v -> b h k v', b_i[..., None] * k_i, v_i - (k_i[..., None] * S).sum(-2))
-        o[:, i] = torch.einsum('b h k, b h k v -> b h v', q_i, S)
+        S = S + torch.einsum(
+            "b h k, b h v -> b h k v",
+            b_i[..., None] * k_i,
+            v_i - (k_i[..., None] * S).sum(-2),
+        )
+        o[:, i] = torch.einsum("b h k, b h k v -> b h v", q_i, S)
     if not output_final_state:
         S = None
     return o.to(dtype), S
@@ -92,8 +97,7 @@ def assert_close(prefix, ref, tri, atol=5e-3, rtol=5e-3):
     assert not torch.isnan(ref).any(), f"{prefix}: NaN in ref"
     assert not torch.isnan(tri).any(), f"{prefix}: NaN in tri"
     torch.testing.assert_close(
-        ref_f, tri_f, atol=atol, rtol=rtol,
-        msg=f"{prefix} diff: {abs_diff:.6f}"
+        ref_f, tri_f, atol=atol, rtol=rtol, msg=f"{prefix} diff: {abs_diff:.6f}"
     )
 
 
@@ -103,7 +107,16 @@ def assert_close(prefix, ref, tri, atol=5e-3, rtol=5e-3):
 
 
 @pytest.mark.parametrize(
-    ("B", "T", "H", "D", "scale", "gate_logit_normalizer", "use_qk_l2norm_in_kernel", "dtype"),
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
     [
         pytest.param(
             *test,
@@ -117,9 +130,14 @@ def assert_close(prefix, ref, tri, atol=5e-3, rtol=5e-3):
     ],
 )
 def test_recurrent_kda_vs_naive(
-    B: int, T: int, H: int, D: int,
-    scale: float, gate_logit_normalizer: float,
-    use_qk_l2norm_in_kernel: bool, dtype: torch.dtype,
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
 ):
     """Recurrent KDA kernel matches naive recurrent KDA reference."""
     torch.manual_seed(42)
@@ -128,8 +146,10 @@ def test_recurrent_kda_vs_naive(
     q = torch.rand(B, T, H, D, dtype=dtype, device=device)
     k = torch.rand(B, T, H, D, dtype=dtype, device=device)
     v = torch.rand(B, T, H, D, dtype=dtype, device=device)
-    g = (F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float, device=device))
-         / gate_logit_normalizer).to(dtype)
+    g = (
+        F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float, device=device))
+        / gate_logit_normalizer
+    ).to(dtype)
     beta = torch.randn(B, T, H, dtype=dtype, device=device).sigmoid()
     h0_bf16 = torch.randn(B, H, D, D, dtype=torch.bfloat16, device=device) * 0.01
     # Reference needs f32 [B, H, K, V] state
@@ -149,7 +169,11 @@ def test_recurrent_kda_vs_naive(
 
     # Recurrent KDA kernel (bf16 state [B, H, V, K], in-kernel L2 norm)
     tri, tri_ht = recurrent_kda(
-        q=q, k=k, v=v, g=g, beta=beta,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
         scale=scale,
         initial_state=h0_bf16.clone(),
         output_final_state=True,
@@ -163,7 +187,16 @@ def test_recurrent_kda_vs_naive(
 
 @pytest.mark.skipif(not _has_fla, reason="fla package not installed")
 @pytest.mark.parametrize(
-    ("B", "T", "H", "D", "scale", "gate_logit_normalizer", "use_qk_l2norm_in_kernel", "dtype"),
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
     [
         pytest.param(
             *test,
@@ -177,9 +210,14 @@ def test_recurrent_kda_vs_naive(
     ],
 )
 def test_recurrent_kda_vs_fla(
-    B: int, T: int, H: int, D: int,
-    scale: float, gate_logit_normalizer: float,
-    use_qk_l2norm_in_kernel: bool, dtype: torch.dtype,
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
 ):
     """Recurrent KDA kernel matches fla fused_recurrent_kda."""
     torch.manual_seed(42)
@@ -188,8 +226,10 @@ def test_recurrent_kda_vs_fla(
     q = torch.rand(B, T, H, D, dtype=dtype, device=device)
     k = torch.rand(B, T, H, D, dtype=dtype, device=device)
     v = torch.rand(B, T, H, D, dtype=dtype, device=device)
-    g = (F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float, device=device))
-         / gate_logit_normalizer).to(dtype)
+    g = (
+        F.logsigmoid(torch.randn(B, T, H, D, dtype=torch.float, device=device))
+        / gate_logit_normalizer
+    ).to(dtype)
     beta = torch.randn(B, T, H, dtype=dtype, device=device).sigmoid()
     h0_bf16 = torch.randn(B, H, D, D, dtype=torch.bfloat16, device=device) * 0.01
     # fla needs f32 [B, H, K, V] state
@@ -197,7 +237,10 @@ def test_recurrent_kda_vs_fla(
 
     # fla reference (f32 state [K,V])
     ref, ref_ht = fused_recurrent_kda(
-        q=q.float(), k=k.float(), v=v.float(), g=g.float(),
+        q=q.float(),
+        k=k.float(),
+        v=v.float(),
+        g=g.float(),
         beta=beta.float(),
         scale=scale,
         initial_state=h0_f32.clone(),
@@ -207,7 +250,11 @@ def test_recurrent_kda_vs_fla(
 
     # Recurrent KDA (bf16 state [B, H, V, K])
     tri, tri_ht = recurrent_kda(
-        q=q, k=k, v=v, g=g, beta=beta,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
         scale=scale,
         initial_state=h0_bf16.clone(),
         output_final_state=True,
@@ -220,8 +267,17 @@ def test_recurrent_kda_vs_fla(
 
 
 @pytest.mark.parametrize(
-    ("B", "H", "D", "scale", "gate_logit_normalizer", "use_qk_l2norm_in_kernel",
-     "use_gate_in_kernel", "safe_gate", "dtype"),
+    (
+        "B",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "use_qk_l2norm_in_kernel",
+        "use_gate_in_kernel",
+        "safe_gate",
+        "dtype",
+    ),
     [
         pytest.param(
             *test,
@@ -238,10 +294,14 @@ def test_recurrent_kda_vs_fla(
     ],
 )
 def test_vllm_decode(
-    B: int, H: int, D: int,
-    scale: float, gate_logit_normalizer: float,
+    B: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
     use_qk_l2norm_in_kernel: bool,
-    use_gate_in_kernel: bool, safe_gate: bool,
+    use_gate_in_kernel: bool,
+    safe_gate: bool,
     dtype: torch.dtype,
 ):
     """vLLM-style decoding: continuous batching with paged state, Recurrent KDA vs naive."""
@@ -250,7 +310,9 @@ def test_vllm_decode(
 
     # Setup cache pool (bf16 [V,K] for Recurrent KDA)
     max_cache_slots = B * 3
-    state_pool_bf16 = torch.randn(max_cache_slots, H, D, D, dtype=torch.bfloat16, device=device)
+    state_pool_bf16 = torch.randn(
+        max_cache_slots, H, D, D, dtype=torch.bfloat16, device=device
+    )
     state_indices = torch.randperm(max_cache_slots, device=device)[:B].int()
 
     # Fill unaccessed slots with huge value to detect out-of-bound access
@@ -265,13 +327,19 @@ def test_vllm_decode(
     q = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
     k = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
     v = torch.rand(1, total_tokens, H, D, dtype=dtype, device=device)
-    g = torch.randn(1, total_tokens, H, D,
-                     dtype=torch.float if not use_gate_in_kernel else dtype,
-                     device=device)
+    g = torch.randn(
+        1,
+        total_tokens,
+        H,
+        D,
+        dtype=torch.float if not use_gate_in_kernel else dtype,
+        device=device,
+    )
 
     if use_gate_in_kernel:
-        A_log = torch.log(torch.randn(1, 1, H, 1, dtype=torch.float32, device=device)
-                          .uniform_(1, 16)).squeeze()
+        A_log = torch.log(
+            torch.randn(1, 1, H, 1, dtype=torch.float32, device=device).uniform_(1, 16)
+        ).squeeze()
         dt_bias = torch.randn(H * D, dtype=torch.float32, device=device)
         lower_bound = -5.0 if safe_gate else None
         naive_gate_fn = naive_kda_lowerbound_gate if safe_gate else naive_kda_gate
@@ -284,7 +352,9 @@ def test_vllm_decode(
 
     beta = torch.randn(1, total_tokens, H, dtype=dtype, device=device).sigmoid()
 
-    cu_seqlens = torch.arange(0, total_tokens + 1, step=T, device=device, dtype=torch.long)
+    cu_seqlens = torch.arange(
+        0, total_tokens + 1, step=T, device=device, dtype=torch.long
+    )
     # Reference needs f32 [K,V] state; Recurrent KDA uses bf16 [V,K] directly
     ref_state_pool = state_pool_bf16.transpose(-1, -2).float()
     tri_state_pool_bf16 = state_pool_bf16.clone()
@@ -307,8 +377,11 @@ def test_vllm_decode(
             q=F.normalize(q_i.float(), p=2, dim=-1),
             k=F.normalize(k_i.float(), p=2, dim=-1),
             v=v_i.float(),
-            g=(naive_gate_fn(g_i, A_log, dt_bias, **gate_kwargs).float()
-               if use_gate_in_kernel else g_i.float()),
+            g=(
+                naive_gate_fn(g_i, A_log, dt_bias, **gate_kwargs).float()
+                if use_gate_in_kernel
+                else g_i.float()
+            ),
             beta=beta_i.float(),
             scale=scale,
             initial_state=h_init.clone(),
@@ -321,8 +394,13 @@ def test_vllm_decode(
 
     # Recurrent KDA kernel with cu_seqlens + ssm_state_indices (bf16 state)
     tri_out, _ = recurrent_kda(
-        q=q, k=k, v=v, g=g, beta=beta,
-        A_log=A_log, dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
         scale=scale,
         initial_state=tri_state_pool_bf16,
         output_final_state=True,

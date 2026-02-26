@@ -66,8 +66,9 @@ def write_h_chunk_to_smem(h_chunk_f32, h_sh_chunk, lane_idx, k_base):
 
 
 @cute.jit
-def store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_offset,
-                          HEAD_DIM: cutlass.Constexpr[int]):
+def store_h_smem_to_gmem(
+    h_sh_chunk, h_out, tidx, v_row_offset, HEAD_DIM: cutlass.Constexpr[int]
+):
     """Store H from SMEM to GMEM using 128-bit stores."""
     copy_bits = 128
     copy_elems = copy_bits // cutlass.BFloat16.width
@@ -112,8 +113,9 @@ def store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_offset,
 
 
 @cute.jit
-def load_h_chunk_async(h_sh_chunk, h_global, tidx, row_offset,
-                        HEAD_DIM: cutlass.Constexpr[int]):
+def load_h_chunk_async(
+    h_sh_chunk, h_global, tidx, row_offset, HEAD_DIM: cutlass.Constexpr[int]
+):
     """Load H chunk from GMEM to SMEM using async copy."""
     copy_bits = 128
     copy_elems = copy_bits // cutlass.BFloat16.width
@@ -163,13 +165,19 @@ def load_h_chunk_async(h_sh_chunk, h_global, tidx, row_offset,
                 cute.copy(atom_async_copy, tS, tD)
 
 
-
 @cute.jit
-def compute_gate_exp_chunk(g_exp_chunk, g_head, k_base,
-                            A_log_val, gDtBias, h_K_offset, lower_bound_val,
-                            USE_GATE_IN_KERNEL: cutlass.Constexpr[int],
-                            HAS_DT_BIAS: cutlass.Constexpr[int],
-                            USE_LOWER_BOUND: cutlass.Constexpr[int]):
+def compute_gate_exp_chunk(
+    g_exp_chunk,
+    g_head,
+    k_base,
+    A_log_val,
+    gDtBias,
+    h_K_offset,
+    lower_bound_val,
+    USE_GATE_IN_KERNEL: cutlass.Constexpr[int],
+    HAS_DT_BIAS: cutlass.Constexpr[int],
+    USE_LOWER_BOUND: cutlass.Constexpr[int],
+):
     """Load gate from global memory and compute exp(gate).
 
     When USE_GATE_IN_KERNEL=0: g is pre-computed log-space gate, just exp it.
@@ -243,8 +251,9 @@ def compute_gate_exp_chunk(g_exp_chunk, g_head, k_base,
 
 
 @cute.jit
-def normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps,
-                                    HEAD_DIM: cutlass.Constexpr[int]):
+def normalize_and_store_qk_to_smem(
+    q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM: cutlass.Constexpr[int]
+):
     """L2-normalize Q and K vectors, then store to shared memory."""
     # ELEMS_PER_LANE = HEAD_DIM // 32 (2 for HD=64, 4 for HD=128)
     q_reg = cute.make_rmem_tensor((HEAD_DIM // 32,), cutlass.Float32)
@@ -372,8 +381,9 @@ def decay_h_in_place(h_chunk, g_exp_chunk):
 
 
 @cute.jit
-def cross_warp_reduce_single(reduce_sh, slot, warp_idx, lane_idx, value,
-                              NUM_WARPS: cutlass.Constexpr[int]):
+def cross_warp_reduce_single(
+    reduce_sh, slot, warp_idx, lane_idx, value, NUM_WARPS: cutlass.Constexpr[int]
+):
     """
     Cross-warp reduction for a single value using bank-conflict-free layout.
     Layout: [slot, lane_idx, warp_idx]
@@ -382,10 +392,7 @@ def cross_warp_reduce_single(reduce_sh, slot, warp_idx, lane_idx, value,
     cute.arch.sync_threads()
     reduced_value = cutlass.Float32(0.0)
     if NUM_WARPS == 2:
-        reduced_value = (
-            reduce_sh[slot, lane_idx, 0]
-            + reduce_sh[slot, lane_idx, 1]
-        )
+        reduced_value = reduce_sh[slot, lane_idx, 0] + reduce_sh[slot, lane_idx, 1]
     elif NUM_WARPS == 4:
         reduced_value = (
             reduce_sh[slot, lane_idx, 0]
@@ -397,8 +404,16 @@ def cross_warp_reduce_single(reduce_sh, slot, warp_idx, lane_idx, value,
 
 
 @cute.jit
-def cross_warp_reduce_two(reduce_sh, slot1, slot2, warp_idx, lane_idx, value1, value2,
-                           NUM_WARPS: cutlass.Constexpr[int]):
+def cross_warp_reduce_two(
+    reduce_sh,
+    slot1,
+    slot2,
+    warp_idx,
+    lane_idx,
+    value1,
+    value2,
+    NUM_WARPS: cutlass.Constexpr[int],
+):
     """
     Cross-warp reduction for two values simultaneously using bank-conflict-free layout.
     Layout: [slot, lane_idx, warp_idx]
@@ -409,14 +424,8 @@ def cross_warp_reduce_two(reduce_sh, slot1, slot2, warp_idx, lane_idx, value1, v
     reduced1 = cutlass.Float32(0.0)
     reduced2 = cutlass.Float32(0.0)
     if NUM_WARPS == 2:
-        reduced1 = (
-            reduce_sh[slot1, lane_idx, 0]
-            + reduce_sh[slot1, lane_idx, 1]
-        )
-        reduced2 = (
-            reduce_sh[slot2, lane_idx, 0]
-            + reduce_sh[slot2, lane_idx, 1]
-        )
+        reduced1 = reduce_sh[slot1, lane_idx, 0] + reduce_sh[slot1, lane_idx, 1]
+        reduced2 = reduce_sh[slot2, lane_idx, 0] + reduce_sh[slot2, lane_idx, 1]
     elif NUM_WARPS == 4:
         reduced1 = (
             reduce_sh[slot1, lane_idx, 0]
@@ -443,14 +452,14 @@ def recurrent_kda_decode_kernel(
     gQ: cute.Tensor,
     gK: cute.Tensor,
     gV: cute.Tensor,
-    gG: cute.Tensor,       # [B, T, HV, K] log-space gate (or raw input if USE_GATE_IN_KERNEL)
-    gBeta: cute.Tensor,    # [B, T, HV] pre-sigmoided
-    gH: cute.Tensor,       # state: bf16 [B,HV,V,K] (modified in-place)
+    gG: cute.Tensor,  # [B, T, HV, K] log-space gate (or raw input if USE_GATE_IN_KERNEL)
+    gBeta: cute.Tensor,  # [B, T, HV] pre-sigmoided
+    gH: cute.Tensor,  # state: bf16 [B,HV,V,K] (modified in-place)
     gO: cute.Tensor,
-    gALog: cute.Tensor,    # [H] float32 (A_log per query head)
+    gALog: cute.Tensor,  # [H] float32 (A_log per query head)
     gDtBias: cute.Tensor,  # [H*K] float32 (dt_bias per head and K)
-    gCuSeqlens: cute.Tensor,       # [N+1] int32 — raw cu_seqlens
-    gSsmStateIndices: cute.Tensor, # [N] int32 — raw ssm_state_indices
+    gCuSeqlens: cute.Tensor,  # [N+1] int32 — raw cu_seqlens
+    gSsmStateIndices: cute.Tensor,  # [N] int32 — raw ssm_state_indices
     scale: cutlass.Float32,
     eps: cutlass.Float32,
     lower_bound: cutlass.Float32,
@@ -503,27 +512,35 @@ def recurrent_kda_decode_kernel(
     # Allocate SMEM — always 4 H chunk buffers for simplicity
     # (unused ones waste ~4.5KB for HEAD_DIM=64, trivial vs SM100's 228KB)
     h_sh_chunk0 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16,
+        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
     h_sh_chunk1 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16,
+        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
     h_sh_chunk2 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16,
+        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
     h_sh_chunk3 = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
+        cutlass.BFloat16,
+        cute.make_layout((32, HEAD_DIM), stride=(HEAD_DIM + H_SMEM_PADDING, 1)),
         byte_alignment=128,
     )
 
     q_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
     k_sh = smem.allocate_tensor(cutlass.Float32, HEAD_DIM)
 
-    pred_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32)))
-    out_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32)))
+    pred_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
+    )
+    out_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((HEAD_DIM // 32, 32))
+    )
 
     # Derive state view — bf16 [V,K]
     h_global = gH[(batch_idx, value_head_idx, None, None)]
@@ -548,7 +565,9 @@ def recurrent_kda_decode_kernel(
 
     # Use shared helper for Q/K normalization (only warp 0 does the work)
     if warp_idx == 0:
-        normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM)
+        normalize_and_store_qk_to_smem(
+            q_head, k_head, q_sh, k_sh, lane_idx, scale, eps, HEAD_DIM
+        )
 
     cute.arch.sync_threads()
 
@@ -586,9 +605,18 @@ def recurrent_kda_decode_kernel(
     cute.arch.sync_threads()
 
     # Load/compute per-K gate (same for all V-chunks since T=1)
-    compute_gate_exp_chunk(g_exp_chunk, g_head, k_base,
-                           A_log_val, gDtBias, h_K_offset, lower_bound_val,
-                           USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND)
+    compute_gate_exp_chunk(
+        g_exp_chunk,
+        g_head,
+        k_base,
+        A_log_val,
+        gDtBias,
+        h_K_offset,
+        lower_bound_val,
+        USE_GATE_IN_KERNEL,
+        HAS_DT_BIAS,
+        USE_LOWER_BOUND,
+    )
 
     pred = cutlass.Float32(0.0)
     pred2 = cutlass.Float32(0.0)
@@ -613,10 +641,7 @@ def recurrent_kda_decode_kernel(
     cute.arch.sync_threads()
     pred_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        pred_final = (
-            pred_sh[0, lane_idx]
-            + pred_sh[1, lane_idx]
-        )
+        pred_final = pred_sh[0, lane_idx] + pred_sh[1, lane_idx]
     elif HEAD_DIM == 128:
         pred_final = (
             pred_sh[0, lane_idx]
@@ -652,10 +677,7 @@ def recurrent_kda_decode_kernel(
     cute.arch.sync_threads()
     out_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        out_final = (
-            out_sh[0, lane_idx]
-            + out_sh[1, lane_idx]
-        )
+        out_final = out_sh[0, lane_idx] + out_sh[1, lane_idx]
     elif HEAD_DIM == 128:
         out_final = (
             out_sh[0, lane_idx]
@@ -705,10 +727,7 @@ def recurrent_kda_decode_kernel(
     cute.arch.sync_threads()
     pred_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        pred_final = (
-            pred_sh[0, lane_idx]
-            + pred_sh[1, lane_idx]
-        )
+        pred_final = pred_sh[0, lane_idx] + pred_sh[1, lane_idx]
     elif HEAD_DIM == 128:
         pred_final = (
             pred_sh[0, lane_idx]
@@ -743,10 +762,7 @@ def recurrent_kda_decode_kernel(
     cute.arch.sync_threads()
     out_final = cutlass.Float32(0.0)
     if HEAD_DIM == 64:
-        out_final = (
-            out_sh[0, lane_idx]
-            + out_sh[1, lane_idx]
-        )
+        out_final = out_sh[0, lane_idx] + out_sh[1, lane_idx]
     elif HEAD_DIM == 128:
         out_final = (
             out_sh[0, lane_idx]
@@ -979,14 +995,18 @@ _dummy_cache = {}  # device -> dict of pre-allocated dummy tensors
 
 
 @functools.cache
-def _get_compiled_kernel(HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS):
+def _get_compiled_kernel(
+    HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS
+):
     """Cache compiled kernel for given configuration."""
     B, H, HV, N = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
     K, V = HEAD_DIM, HEAD_DIM
 
     def make_fake(shape, dtype=cute.BFloat16):
         return cute.runtime.make_fake_compact_tensor(
-            dtype, shape, assumed_align=32,
+            dtype,
+            shape,
+            assumed_align=32,
             stride_order=tuple(reversed(range(len(shape)))),
         )
 
@@ -996,22 +1016,26 @@ def _get_compiled_kernel(HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BO
 
     return cute.compile(
         recurrent_kda_launch,
-        make_fake((B, T_dim, H, K)),            # q
-        make_fake((B, T_dim, H, K)),            # k
-        make_fake((B, T_dim, HV, V)),           # v
-        make_fake((B, T_dim, HV, K)),           # g
-        make_fake((B, T_dim, HV)),              # beta
-        make_fake((N, HV_state, V, K)),         # state
-        make_fake((B, T_dim, HV, V)),           # output
-        make_fake((ALog_sym,), dtype=cute.Float32),   # A_log
-        make_fake((HK_sym,), dtype=cute.Float32),     # dt_bias
-        make_fake((CuSeqlens_sym,), dtype=cute.Int32), # cu_seqlens
-        make_fake((SsiB_sym,), dtype=cute.Int32),      # ssm_state_indices
-        cutlass.Float32(0.0),                   # scale
-        cutlass.Float32(0.0),                   # eps
-        cutlass.Float32(0.0),                   # lower_bound
+        make_fake((B, T_dim, H, K)),  # q
+        make_fake((B, T_dim, H, K)),  # k
+        make_fake((B, T_dim, HV, V)),  # v
+        make_fake((B, T_dim, HV, K)),  # g
+        make_fake((B, T_dim, HV)),  # beta
+        make_fake((N, HV_state, V, K)),  # state
+        make_fake((B, T_dim, HV, V)),  # output
+        make_fake((ALog_sym,), dtype=cute.Float32),  # A_log
+        make_fake((HK_sym,), dtype=cute.Float32),  # dt_bias
+        make_fake((CuSeqlens_sym,), dtype=cute.Int32),  # cu_seqlens
+        make_fake((SsiB_sym,), dtype=cute.Int32),  # ssm_state_indices
+        cutlass.Float32(0.0),  # scale
+        cutlass.Float32(0.0),  # eps
+        cutlass.Float32(0.0),  # lower_bound
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        HEAD_DIM, USE_GATE_IN_KERNEL, HAS_DT_BIAS, USE_LOWER_BOUND, USE_CU_SEQLENS,
+        HEAD_DIM,
+        USE_GATE_IN_KERNEL,
+        HAS_DT_BIAS,
+        USE_LOWER_BOUND,
+        USE_CU_SEQLENS,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
@@ -1117,15 +1141,22 @@ def recurrent_kda(
             raise ValueError(f"Batch size must be 1 with cu_seqlens, got B={B}")
         N = cu_seqlens.shape[0] - 1
         cu_seqlens_i32 = cu_seqlens.to(torch.int32)
-        ssi = (ssm_state_indices.to(torch.int32) if ssm_state_indices is not None
-               else torch.arange(N, dtype=torch.int32, device=device))
+        ssi = (
+            ssm_state_indices.to(torch.int32)
+            if ssm_state_indices is not None
+            else torch.arange(N, dtype=torch.int32, device=device)
+        )
         if initial_state is None:
             max_idx = int(ssi.max().item()) + 1 if N > 0 else N
             state = torch.zeros(max_idx, HV, V, K, device=device, dtype=torch.bfloat16)
         else:
             state = initial_state
-        if (output is not None and output.shape == v.shape
-                and output.dtype == q.dtype and output.device == device):
+        if (
+            output is not None
+            and output.shape == v.shape
+            and output.dtype == q.dtype
+            and output.device == device
+        ):
             out_buf = output
         else:
             out_buf = torch.empty_like(v)
@@ -1139,8 +1170,12 @@ def recurrent_kda(
             state = initial_state[ssm_state_indices].contiguous()
         else:
             state = initial_state.contiguous()
-        if (output is not None and output.shape == (B, 1, HV, V)
-                and output.dtype == q.dtype and output.device == device):
+        if (
+            output is not None
+            and output.shape == (B, 1, HV, V)
+            and output.dtype == q.dtype
+            and output.device == device
+        ):
             out_buf = output
         else:
             out_buf = torch.empty(B, 1, HV, V, device=device, dtype=q.dtype)
@@ -1156,17 +1191,23 @@ def recurrent_kda(
     global _dummy_cache
     if device not in _dummy_cache:
         _dummy_cache[device] = {
-            'f32_1': torch.zeros(1, device=device, dtype=torch.float32),
-            'i32_1': torch.zeros(1, device=device, dtype=torch.int32),
+            "f32_1": torch.zeros(1, device=device, dtype=torch.float32),
+            "i32_1": torch.zeros(1, device=device, dtype=torch.int32),
         }
     dc = _dummy_cache[device]
 
     compiled(
-        q, k, v, g, beta, state, out_buf,
-        A_log if A_log is not None else dc['f32_1'],
-        dt_bias if dt_bias is not None else dc['f32_1'],
-        cu_seqlens_i32 if cu_seqlens_i32 is not None else dc['i32_1'],
-        ssi if ssi is not None else dc['i32_1'],
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        out_buf,
+        A_log if A_log is not None else dc["f32_1"],
+        dt_bias if dt_bias is not None else dc["f32_1"],
+        cu_seqlens_i32 if cu_seqlens_i32 is not None else dc["i32_1"],
+        ssi if ssi is not None else dc["i32_1"],
         scale if scale is not None else 1.0 / math.sqrt(K),
         1e-6,
         lower_bound if lower_bound is not None else 0.0,
