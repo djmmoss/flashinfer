@@ -24,9 +24,32 @@ from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
     get_device_sm_count,
     _get_cache_buf,
 )
+
+try:
+    from .gdn_kernels import chunk_gated_delta_rule_sm100, _has_cute_dsl_prefill
+except ImportError:
+    _has_cute_dsl_prefill = False
+    chunk_gated_delta_rule_sm100 = None
+
+
+def _can_use_sm100_prefill(device, num_q_heads, num_k_heads, num_v_heads):
+    """Check if SM100 CuTe DSL kernel can handle this config."""
+    if not _has_cute_dsl_prefill:
+        return False
+    cc = get_compute_capability(device)
+    if cc[0] < 10:
+        return False
+    # SM100 kernel requires num_q_heads == num_k_heads (no separate GQA dispatch)
+    # and h_v divisible by h_q
+    if num_q_heads != num_k_heads:
+        return False
+    if num_v_heads % num_q_heads != 0:
+        return False
+    return True
 
 
 @functools.cache
@@ -153,7 +176,8 @@ def chunk_gated_delta_rule(
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
         - Supports GVA: ``num_v_heads > num_q_heads = num_k_heads``
         - The final state is in k-last layout ``[N, H, V, K]``.
-        - Requires SM90 (Hopper) architecture.
+        - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.
+        - On SM100+ with CuTe DSL installed, uses an optimized SM100 kernel.
     """
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
 
@@ -188,6 +212,54 @@ def chunk_gated_delta_rule(
             device=q.device,
         )
 
+    num_k_heads = k.size(1)
+
+    # SM100 CuTe DSL dispatch path
+    if _can_use_sm100_prefill(q.device, num_q_heads, num_k_heads, num_v_heads):
+        # Convert gate format: FlashInfer alpha (linear) → SM100 g (log-space)
+        if g is not None:
+            g_sm100 = torch.log(g.float() + 1e-10).to(q.dtype)
+        else:
+            g_sm100 = torch.zeros(
+                total_seq_len, num_sab_heads, dtype=q.dtype, device=q.device
+            )
+
+        if beta is not None:
+            beta_sm100 = beta.to(q.dtype)
+        else:
+            beta_sm100 = torch.ones(
+                total_seq_len, num_sab_heads, dtype=q.dtype, device=q.device
+            )
+
+        # Reshape 3D → 4D: [total_seq_len, H, D] → [1, total_seq_len, H, D]
+        q_4d = q.unsqueeze(0)
+        k_4d = k.unsqueeze(0)
+        v_4d = v.unsqueeze(0)
+        g_4d = g_sm100.unsqueeze(0)
+        beta_4d = beta_sm100.unsqueeze(0)
+        o_4d = output.unsqueeze(0)
+
+        # SM100 kernel uses same state layout as FlashInfer (k-last [N,H,V,K]):
+        # state_layout stride=(head_dim, 1) maps dim-2=V, dim-3=K, matching contiguous [N,H,V,K].
+        chunk_gated_delta_rule_sm100(
+            q_4d,
+            k_4d,
+            v_4d,
+            g_4d,
+            beta_4d,
+            o_4d,
+            scale,
+            initial_state,
+            cu_seqlens.to(torch.int32),
+            output_state,
+        )
+
+        if output_final_state:
+            return output, output_state
+        else:
+            return output
+
+    # SM90 CUTLASS kernel path
     # Prepare workspace buffer for TMA Store in kernel
     # 128B tensormap for each SM on Hopper architecture
     workspace_size = get_device_sm_count(q.device) * 128

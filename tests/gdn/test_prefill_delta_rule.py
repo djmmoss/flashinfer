@@ -30,10 +30,21 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
 def _skip_if_not_sm90():
-    """Skip test if not SM90 architecture."""
+    """Skip test if not SM90+ architecture.
+
+    On SM100+, the public API dispatches to the CuTe DSL kernel which has a
+    known JIT caching bug (CUDA_ERROR_MISALIGNED_ADDRESS) when invoked
+    multiple times in the same process. SM100 correctness is validated by
+    the dedicated tests in test_prefill_sm100.py instead.
+    """
     cc = get_compute_capability(torch.device("cuda"))
-    if cc[0] != 9:
-        pytest.skip(f"GDN prefill requires SM90, but got SM{cc[0]}{cc[1]}")
+    if cc[0] < 9:
+        pytest.skip(f"GDN prefill requires SM90+, but got SM{cc[0]}{cc[1]}")
+    if cc[0] >= 10:
+        pytest.skip(
+            "SM100+ uses CuTe DSL kernel (tested in test_prefill_sm100.py); "
+            "in-process multi-invocation crashes due to upstream CuTe DSL JIT bug"
+        )
 
 
 def _test_prefill_kernel(

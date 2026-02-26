@@ -11,6 +11,7 @@ CuTe DSL variants optimized for specific use cases.
 Exported Kernels:
 - gated_delta_rule: BF16 hidden state decode kernel (T=1,2,3,4)
 - GatedDeltaRuleKernel: Kernel class for advanced usage
+- chunk_gated_delta_rule_sm100: SM100 CuTe DSL prefill kernel
 """
 
 from typing import Optional, Type
@@ -27,7 +28,19 @@ except ImportError:
     gated_delta_rule = None  # type: ignore
     GatedDeltaRuleKernel: Optional[Type] = None  # type: ignore
 
+try:
+    from .gdn_prefill_sm100 import (
+        chunk_gated_delta_rule_sm100,
+    )
+
+    _has_cute_dsl_prefill = True
+except ImportError:
+    _has_cute_dsl_prefill = False
+    chunk_gated_delta_rule_sm100 = None  # type: ignore
+
 __all__ = [
     "gated_delta_rule",
     "GatedDeltaRuleKernel",
+    "chunk_gated_delta_rule_sm100",
+    "_has_cute_dsl_prefill",
 ]
