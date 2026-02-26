@@ -1,5 +1,5 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# Adapted for CuTe DSL kernel testing
+# Adapted for Recurrent KDA kernel testing
 
 import pytest
 import torch
@@ -116,12 +116,12 @@ def assert_close(prefix, ref, tri, atol=5e-3, rtol=5e-3):
         ]
     ],
 )
-def test_cutedsl_vs_naive(
+def test_recurrent_kda_vs_naive(
     B: int, T: int, H: int, D: int,
     scale: float, gate_logit_normalizer: float,
     use_qk_l2norm_in_kernel: bool, dtype: torch.dtype,
 ):
-    """CuTe DSL kernel matches naive recurrent KDA reference."""
+    """Recurrent KDA kernel matches naive recurrent KDA reference."""
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -147,7 +147,7 @@ def test_cutedsl_vs_naive(
         output_final_state=True,
     )
 
-    # CuTe DSL kernel (bf16 state [B, H, V, K], in-kernel L2 norm)
+    # Recurrent KDA kernel (bf16 state [B, H, V, K], in-kernel L2 norm)
     tri, tri_ht = recurrent_kda(
         q=q, k=k, v=v, g=g, beta=beta,
         scale=scale,
@@ -157,7 +157,7 @@ def test_cutedsl_vs_naive(
     )
 
     assert_close("o", ref, tri)
-    # Convert CuTe DSL bf16 [V,K] state to f32 [K,V] for comparison
+    # Convert Recurrent KDA bf16 [V,K] state to f32 [K,V] for comparison
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2).float())
 
 
@@ -176,12 +176,12 @@ def test_cutedsl_vs_naive(
         ]
     ],
 )
-def test_cutedsl_vs_fla(
+def test_recurrent_kda_vs_fla(
     B: int, T: int, H: int, D: int,
     scale: float, gate_logit_normalizer: float,
     use_qk_l2norm_in_kernel: bool, dtype: torch.dtype,
 ):
-    """CuTe DSL kernel matches fla fused_recurrent_kda."""
+    """Recurrent KDA kernel matches fla fused_recurrent_kda."""
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -205,7 +205,7 @@ def test_cutedsl_vs_fla(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
-    # CuTe DSL (bf16 state [B, H, V, K])
+    # Recurrent KDA (bf16 state [B, H, V, K])
     tri, tri_ht = recurrent_kda(
         q=q, k=k, v=v, g=g, beta=beta,
         scale=scale,
@@ -215,7 +215,7 @@ def test_cutedsl_vs_fla(
     )
 
     assert_close("o", ref, tri)
-    # Convert CuTe DSL bf16 [V,K] state to f32 [K,V] for comparison
+    # Convert Recurrent KDA bf16 [V,K] state to f32 [K,V] for comparison
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2).float())
 
 
@@ -244,11 +244,11 @@ def test_vllm_decode(
     use_gate_in_kernel: bool, safe_gate: bool,
     dtype: torch.dtype,
 ):
-    """vLLM-style decoding: continuous batching with paged state, CuTe DSL vs naive."""
+    """vLLM-style decoding: continuous batching with paged state, Recurrent KDA vs naive."""
     torch.manual_seed(42)
     device = torch.device("cuda")
 
-    # Setup cache pool (bf16 [V,K] for CuTe DSL)
+    # Setup cache pool (bf16 [V,K] for Recurrent KDA)
     max_cache_slots = B * 3
     state_pool_bf16 = torch.randn(max_cache_slots, H, D, D, dtype=torch.bfloat16, device=device)
     state_indices = torch.randperm(max_cache_slots, device=device)[:B].int()
@@ -285,7 +285,7 @@ def test_vllm_decode(
     beta = torch.randn(1, total_tokens, H, dtype=dtype, device=device).sigmoid()
 
     cu_seqlens = torch.arange(0, total_tokens + 1, step=T, device=device, dtype=torch.long)
-    # Reference needs f32 [K,V] state; CuTe DSL uses bf16 [V,K] directly
+    # Reference needs f32 [K,V] state; Recurrent KDA uses bf16 [V,K] directly
     ref_state_pool = state_pool_bf16.transpose(-1, -2).float()
     tri_state_pool_bf16 = state_pool_bf16.clone()
 
@@ -319,7 +319,7 @@ def test_vllm_decode(
 
     ref_out = torch.cat(ref_outputs, dim=1)
 
-    # CuTe DSL kernel with cu_seqlens + ssm_state_indices (bf16 state)
+    # Recurrent KDA kernel with cu_seqlens + ssm_state_indices (bf16 state)
     tri_out, _ = recurrent_kda(
         q=q, k=k, v=v, g=g, beta=beta,
         A_log=A_log, dt_bias=dt_bias,
@@ -334,7 +334,7 @@ def test_vllm_decode(
     )
 
     assert_close("o", ref_out, tri_out)
-    # Convert CuTe DSL bf16 [V,K] state to f32 [K,V] for comparison
+    # Convert Recurrent KDA bf16 [V,K] state to f32 [K,V] for comparison
     tri_ht_f32 = tri_state_pool_bf16[state_indices.long()].transpose(-1, -2).float()
     assert_close("ht", ref_state_pool[state_indices.long()], tri_ht_f32)
 
