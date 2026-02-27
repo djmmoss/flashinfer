@@ -7,10 +7,12 @@ import torch.nn.functional as F
 
 from flashinfer.utils import is_sm100a_supported
 
-if not is_sm100a_supported(torch.device("cuda")):
-    pytest.skip("Recurrent KDA requires SM100a (Blackwell)", allow_module_level=True)
+try:
+    from flashinfer.kda_kernels import recurrent_kda
 
-from flashinfer.kda_kernels import recurrent_kda
+    _has_recurrent_kda = True
+except ImportError:
+    _has_recurrent_kda = False
 
 try:
     from fla.ops.kda import fused_recurrent_kda
@@ -18,6 +20,14 @@ try:
     _has_fla = True
 except ImportError:
     _has_fla = False
+
+
+def _skip_if_not_sm100():
+    """Skip test if not Blackwell (SM100+) architecture."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Recurrent KDA requires SM100a (Blackwell)")
+    if not _has_recurrent_kda:
+        pytest.skip("recurrent_kda kernel not available (missing cutlass DSL deps)")
 
 
 # ==============================================================================
@@ -145,6 +155,7 @@ def test_recurrent_kda_vs_naive(
     dtype: torch.dtype,
 ):
     """Recurrent KDA kernel matches naive recurrent KDA reference."""
+    _skip_if_not_sm100()
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -225,6 +236,7 @@ def test_recurrent_kda_vs_fla(
     dtype: torch.dtype,
 ):
     """Recurrent KDA kernel matches fla fused_recurrent_kda."""
+    _skip_if_not_sm100()
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -310,6 +322,7 @@ def test_vllm_decode(
     dtype: torch.dtype,
 ):
     """vLLM-style decoding: continuous batching with paged state, Recurrent KDA vs naive."""
+    _skip_if_not_sm100()
     torch.manual_seed(42)
     device = torch.device("cuda")
 
