@@ -601,11 +601,13 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         if not use_symm_dev_mem:
             ipc_handles.append(create_shared_buffer(aligned_size, group))
         else:
+            # Use the local active device; tp_rank is the global TP rank
+            # and is not a valid local device index for multi-node TP.
             symm_mem = SymmDeviceMemory(
                 aligned_size,
                 tp_size,
                 tp_rank,
-                torch.device("cuda", tp_rank).index,
+                torch.cuda.current_device(),
                 comm_backend,
                 enable_multicast=False,
                 allocate_signal_pads=False,
