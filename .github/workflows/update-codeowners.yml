@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   update-codeowners:
+    if: github.repository == 'flashinfer-ai/flashinfer'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

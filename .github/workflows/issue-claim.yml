@@ -25,6 +25,7 @@ jobs:
     # Only run on issue comments (not PRs) that start with !claim or !assign
     # Skip comments from bots
     if: |
+      github.repository == 'flashinfer-ai/flashinfer' &&
       github.event_name == 'issue_comment' &&
       !github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
@@ -246,7 +247,7 @@ jobs:
 
   auto-assign-on-accept:
     # Poll for users who accepted repo invitations after !assign
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.repository == 'flashinfer-ai/flashinfer' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
