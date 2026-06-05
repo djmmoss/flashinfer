@@ -3,6 +3,7 @@ This is the test file for MaskedBatchedMatmulCuteDSL kernel.
 `test_blockscaled_gemm_python_interface` is the python interface test. For pytorch DLFW, refer to this.
 """
 
+import math
 from typing import Tuple
 
 import cutlass
@@ -22,6 +23,175 @@ from flashinfer.cute_dsl.utils import (
     get_num_sm,
     is_cute_dsl_available,
 )
+
+
+def _requires_sm100_or_sm103(device: torch.device) -> None:
+    device_ver = torch.cuda.get_device_capability(device)
+    if device_ver not in [(10, 0), (10, 3)]:
+        pytest.skip(
+            "CuTeDSL masked grouped GEMM is only supported on SM100/SM103, "
+            f"got {device_ver}."
+        )
+
+
+def _masked_rows_are_finite(out: torch.Tensor, masked_m: torch.Tensor) -> bool:
+    for batch_idx in range(masked_m.numel()):
+        valid_m = int(masked_m[batch_idx].item())
+        if valid_m < out.shape[0]:
+            if not torch.isfinite(out[valid_m:, :, batch_idx].float()).all():
+                return False
+    return True
+
+
+def _dirty_mxfp8_padded_rows(
+    a_torch: torch.Tensor,
+    sfa_torch: torch.Tensor,
+    masked_m: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dirty_a = a_torch.clone()
+    dirty_sfa = sfa_torch.clone()
+    l = masked_m.numel()
+    m = dirty_a.shape[0]
+
+    for batch_idx in range(l):
+        valid_m = int(masked_m[batch_idx].item())
+        if valid_m < m:
+            dirty_a[valid_m:, :, batch_idx] = torch.randn_like(
+                dirty_a[valid_m:, :, batch_idx].float()
+            ).to(dirty_a.dtype)
+
+    # SFA physical layout is (M32, M4, rm, K4, rk, L).
+    sf_k = a_torch.shape[1] // 32
+    assert dirty_sfa.shape == (
+        32,
+        4,
+        math.ceil(m / 128),
+        4,
+        math.ceil(sf_k / 4),
+        l,
+    )
+    for batch_idx in range(l):
+        valid_m = int(masked_m[batch_idx].item())
+        for row in range(valid_m, m):
+            mt = row // 128
+            rem = row % 128
+            m4 = rem // 32
+            m32 = rem % 32
+            dirty_sfa[m32, m4, mt, :, :, batch_idx] = -1
+
+    return dirty_a, dirty_sfa
+
+
+def _copy_cute_output_to_logical_rows(
+    c_tensor: cute.Tensor,
+    c_ref: torch.Tensor,
+) -> torch.Tensor:
+    cute.testing.convert(
+        c_tensor,
+        from_dlpack(c_ref, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+    )
+    return c_ref
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+def test_mxfp8_masked_gemm_padded_rows_do_not_change_valid_rows():
+    torch.manual_seed(1234)
+    device = torch.device("cuda:0")
+    _requires_sm100_or_sm103(device)
+
+    l, m, k, n = 2, 256, 128, 128
+    ab_dtype = "float8_e4m3fn"
+    sf_dtype = "float8_e8m0fnu"
+    c_dtype = "bfloat16"
+    sf_vec_size = 32
+    masked_m = torch.tensor([96, 33], dtype=torch.int32, device=device)
+
+    a_ref = cutlass_torch.matrix(l, m, k, False, cutlass.Float32, device=device)
+    b_ref = cutlass_torch.matrix(l, n, k, False, cutlass.Float32, device=device)
+    _, a_torch = cutlass_torch.cute_tensor_like(
+        a_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, b_torch = cutlass_torch.cute_tensor_like(
+        b_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, _, clean_sfa = create_scale_factor_tensor(
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+    _, _, sfb_torch = create_scale_factor_tensor(
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+
+    dirty_a, dirty_sfa = _dirty_mxfp8_padded_rows(a_torch, clean_sfa, masked_m)
+    clean_ref = cutlass_torch.matrix(l, m, n, False, cutlass.Float32, device=device)
+    dirty_ref = cutlass_torch.matrix(l, m, n, False, cutlass.Float32, device=device)
+    clean_c_tensor, clean_out = cutlass_torch.cute_tensor_like(
+        clean_ref,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    dirty_c_tensor, dirty_out = cutlass_torch.cute_tensor_like(
+        dirty_ref,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    clean_out.fill_(float("nan"))
+    dirty_out.fill_(float("nan"))
+
+    grouped_gemm_nt_masked(
+        (a_torch, clean_sfa),
+        (b_torch, sfb_torch),
+        clean_out,
+        masked_m,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+    )
+    grouped_gemm_nt_masked(
+        (dirty_a, dirty_sfa),
+        (b_torch, sfb_torch),
+        dirty_out,
+        masked_m,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+    )
+
+    clean_logical = _copy_cute_output_to_logical_rows(clean_c_tensor, clean_ref)
+    dirty_logical = _copy_cute_output_to_logical_rows(dirty_c_tensor, dirty_ref)
+
+    valid_row_failures = []
+    for batch_idx in range(l):
+        valid_m = int(masked_m[batch_idx].item())
+        try:
+            torch.testing.assert_close(
+                dirty_logical[:valid_m, :, batch_idx],
+                clean_logical[:valid_m, :, batch_idx],
+                atol=0,
+                rtol=0,
+            )
+        except AssertionError as err:
+            valid_row_failures.append(f"batch {batch_idx}: {err}")
+
+    assert not valid_row_failures, (
+        "padded MXFP8 rows changed valid output rows\n"
+        + "\n".join(valid_row_failures)
+    )
+    print(
+        "masked output rows finite: "
+        f"{_masked_rows_are_finite(dirty_logical, masked_m)}"
+    )
 
 
 @pytest.mark.skipif(
