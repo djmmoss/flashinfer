@@ -111,6 +111,7 @@ class MaskedSchedulerParams:
         c_tiler: Tuple[int, int],
         cluster_shape_mnk: cute.Shape,
         is_swap_ab: bool = False,
+        zero_masked_output: bool = False,
         *,
         loc=None,
         ip=None,
@@ -129,6 +130,7 @@ class MaskedSchedulerParams:
         self._cluster_shape_mnk = cluster_shape_mnk
         self.cluster_shape_mn = cluster_shape_mnk[:2]
         self.is_swap_ab = is_swap_ab
+        self.zero_masked_output = zero_masked_output
         self._loc = loc
 
         self.problem_layout_ncluster_mnl = cute.make_layout(
@@ -148,6 +150,7 @@ class MaskedSchedulerParams:
             self.c_tiler,
             self._cluster_shape_mnk,
             self.is_swap_ab,
+            self.zero_masked_output,
         ]:
             obj_values = extract_mlir_values(obj)
             values += obj_values
@@ -164,6 +167,7 @@ class MaskedSchedulerParams:
                 self.c_tiler,
                 self._cluster_shape_mnk,
                 self.is_swap_ab,
+                self.zero_masked_output,
             ],
             self._values_pos,
             strict=True,
@@ -313,14 +317,20 @@ class MaskedScheduler:
         ]
         accum_tile_m = self._accum_tile_m
         batch_idx = self._current_batch_idx
+        if cutlass.const_expr(self.params.zero_masked_output):
+            num_tiles_m = self.params.problem_shape_ntile_mnl[
+                1 if cutlass.const_expr(is_swap_ab) else 0
+            ]
+        else:
+            num_tiles_m = cute.ceil_div(
+                self.params.masked_m[batch_idx],
+                self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
+            )
 
         while (
             (
                 accum_tile_m
-                + cute.ceil_div(
-                    self.params.masked_m[batch_idx],
-                    self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
-                )
+                + num_tiles_m
             )
             * num_tiles_n
             <= current_work_linear_idx
@@ -336,23 +346,39 @@ class MaskedScheduler:
                     value=dsm_counter + (num_c_stage - 1),
                 )
 
-            accum_tile_m += cute.ceil_div(
-                self.params.masked_m[batch_idx],
-                self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
-            )
+            accum_tile_m += num_tiles_m
             batch_idx += Int32(1)
+            if cutlass.const_expr(self.params.zero_masked_output):
+                num_tiles_m = self.params.problem_shape_ntile_mnl[
+                    1 if cutlass.const_expr(is_swap_ab) else 0
+                ]
+            else:
+                if batch_idx < self.params.masked_m.shape[0]:
+                    num_tiles_m = cute.ceil_div(
+                        self.params.masked_m[batch_idx],
+                        self.params.c_tiler[
+                            1 if cutlass.const_expr(is_swap_ab) else 0
+                        ],
+                    )
+                else:
+                    num_tiles_m = Int32(0)
 
         self._accum_tile_m = accum_tile_m
         self._current_batch_idx = batch_idx
 
         is_valid = self._current_batch_idx < self.params.masked_m.shape[0]
         if is_valid:
-            is_valid = (
-                self._accum_tile_m
-                + cute.ceil_div(
+            if cutlass.const_expr(self.params.zero_masked_output):
+                num_tiles_m = self.params.problem_shape_ntile_mnl[
+                    1 if cutlass.const_expr(is_swap_ab) else 0
+                ]
+            else:
+                num_tiles_m = cute.ceil_div(
                     self.params.masked_m[self._current_batch_idx],
                     self.params.c_tiler[1 if cutlass.const_expr(is_swap_ab) else 0],
                 )
+            is_valid = (
+                self._accum_tile_m + num_tiles_m
             ) * num_tiles_n > current_work_linear_idx
 
         # cur_cluster_coord = self.params.problem_layout_ncluster_mnl.get_hier_coord(
@@ -633,6 +659,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         num_ranks: int = 0,
         is_combine_fusion: bool = False,
         is_swap_ab: bool = False,
+        zero_masked_output: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -667,6 +694,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.num_ranks = num_ranks
         self.is_combine_fusion = is_combine_fusion
         self.is_swap_ab = is_swap_ab
+        self.zero_masked_output = zero_masked_output
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -1032,6 +1060,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.cluster_shape_mn,
             max_active_clusters,
             self.is_swap_ab,
+            self.zero_masked_output,
         )
 
         self.buffer_align_bytes = 1024
@@ -1114,6 +1143,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tma_atom_sfb,
             tma_tensor_sfb,
             tma_atom_c,
+            c_tensor,
             c_tensor if self.is_combine_fusion else tma_tensor_c,
             alpha_tensor,
             topk_weights,
@@ -1156,6 +1186,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
         tma_atom_c: Optional[cute.CopyAtom],
+        mC_direct_mnl: cute.Tensor,
         mC_mnl: cute.Tensor,
         alpha: Optional[cute.Tensor],
         topk_weights: Optional[cute.Tensor],
@@ -1979,6 +2010,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tRS_rC,
                         tRS_sC[(None, None, None, c_buffer)],
                     )
+
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy("async.shared", space="cta")
                     cute.arch.barrier(
@@ -2074,19 +2106,45 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         number_of_threads=epilog_threads,
                     )
 
-                    if cutlass.const_expr(tile_sched_params.dst_signals is not None):
-                        lane_id = tidx % 32
-                        if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
-                            while (dsm_pending_idx < num_experts) and (
-                                read_byte(dsm_pending_packed, dsm_pending_idx)
-                                == dsm_counter
-                            ):
-                                atomic_add_release_global(
-                                    tile_sched_params.dst_signals.toint()
-                                    + sizeof_i32 * dsm_pending_idx,
-                                    value=1,
-                                )
-                                dsm_pending_idx += 1
+                if cutlass.const_expr(self.zero_masked_output):
+                    with cute.arch.elect_one():
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id,
+                        number_of_threads=epilog_threads,
+                    )
+                    for elem_idx in cutlass.range(
+                        tidx,
+                        self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1],
+                        epilog_threads,
+                        unroll=1,
+                    ):
+                        local_m = elem_idx % self.cta_tile_shape_mnk[0]
+                        global_m = cur_tile_dim0_offset + local_m
+                        if (
+                            global_m < mC_direct_mnl.shape[0]
+                            and global_m >= tile_sched_params.masked_m[cur_tile_coord[2]]
+                        ):
+                            local_n = elem_idx // self.cta_tile_shape_mnk[0]
+                            global_n = cur_tile_dim1_offset + local_n
+                            if global_n < mC_direct_mnl.shape[1]:
+                                mC_direct_mnl[
+                                    (global_m, global_n, cur_tile_coord[2])
+                                ] = self.c_dtype(0.0)
+
+                if cutlass.const_expr(tile_sched_params.dst_signals is not None):
+                    lane_id = tidx % 32
+                    if warp_idx == self.epilog_warp_id[0] and lane_id == 0:
+                        while (dsm_pending_idx < num_experts) and (
+                            read_byte(dsm_pending_packed, dsm_pending_idx)
+                            == dsm_counter
+                        ):
+                            atomic_add_release_global(
+                                tile_sched_params.dst_signals.toint()
+                                + sizeof_i32 * dsm_pending_idx,
+                                value=1,
+                            )
+                            dsm_pending_idx += 1
 
                 #
                 # Async arrive accumulator buffer empty
@@ -2518,6 +2576,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
         is_swap_ab: cutlass.Constexpr,
+        zero_masked_output: cutlass.Constexpr,
     ) -> Tuple[MaskedSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
@@ -2539,7 +2598,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = MaskedSchedulerParams(
-            masked_m_tensor, dst_signals, c, c_tiler, cluster_shape_mnl, is_swap_ab
+            masked_m_tensor,
+            dst_signals,
+            c,
+            c_tiler,
+            cluster_shape_mnl,
+            is_swap_ab,
+            zero_masked_output,
         )
         grid = MaskedScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
@@ -2932,6 +2997,7 @@ class MaskedBatchedMatmulCuteDSL:
         num_ranks: int = 0,
         is_combine_fusion: bool = False,
         is_swap_ab: bool = False,
+        zero_masked_output: bool = False,
     ):
         self._m = m
         self._n = n
@@ -2951,6 +3017,7 @@ class MaskedBatchedMatmulCuteDSL:
         self._num_sms = sm_count
         self._is_combine_fusion = is_combine_fusion
         self._is_swap_ab = is_swap_ab
+        self._zero_masked_output = zero_masked_output
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,
             sf_dtype,
@@ -3133,6 +3200,7 @@ class MaskedBatchedMatmulCuteDSL:
             num_ranks=self._num_ranks,
             is_combine_fusion=self._is_combine_fusion,
             is_swap_ab=self._is_swap_ab,
+            zero_masked_output=self._zero_masked_output,
         )(
             a_tensor,
             b_tensor,
@@ -3176,6 +3244,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     enable_barrier_flag: bool = False,
     is_combine_fusion: bool = False,
     is_swap_ab: bool = False,
+    zero_masked_output: bool = False,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -3440,6 +3509,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             num_ranks=num_ranks,
             is_combine_fusion=is_combine_fusion,
             is_swap_ab=is_swap_ab,
+            zero_masked_output=zero_masked_output,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -3659,12 +3729,26 @@ def grouped_gemm_nt_masked(
 
     alpha = kwargs.pop("alpha", None)
     alpha_dtype = kwargs.pop("alpha_dtype", None)
+    zero_masked_output = kwargs.pop("zero_masked_output", False)
 
     assert len(kwargs) == 0, f"Unsupported kwargs: {kwargs}"
 
     major, minor = get_compute_capability(a_torch.device)
     if major == 11 and minor == 0:
         raise ValueError("SM110 is not supported for cute-dsl backend.")
+
+    if zero_masked_output and is_combine_fusion:
+        raise ValueError("zero_masked_output=True is not supported with combine fusion")
+    if zero_masked_output and is_swap_ab:
+        raise ValueError("zero_masked_output=True is not supported with swapped A/B")
+    if zero_masked_output and (
+        dst_signals is not None
+        or barrier_flag_local is not None
+        or barrier_flag_multicast is not None
+    ):
+        raise ValueError(
+            "zero_masked_output=True is not supported with completion signals"
+        )
 
     if is_combine_fusion:
         required = {
@@ -3711,6 +3795,7 @@ def grouped_gemm_nt_masked(
         enable_barrier_flag=barrier_flag_local is not None,
         is_combine_fusion=is_combine_fusion,
         is_swap_ab=is_swap_ab,
+        zero_masked_output=zero_masked_output,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,

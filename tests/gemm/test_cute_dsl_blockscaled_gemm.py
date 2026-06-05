@@ -43,6 +43,27 @@ def _masked_rows_are_finite(out: torch.Tensor, masked_m: torch.Tensor) -> bool:
     return True
 
 
+def _masked_rows_zero_failures(out: torch.Tensor, masked_m: torch.Tensor) -> list[str]:
+    failures = []
+    for batch_idx in range(masked_m.numel()):
+        valid_m = int(masked_m[batch_idx].item())
+        if valid_m < out.shape[0]:
+            masked_rows = out[valid_m:, :, batch_idx].float()
+            if not torch.isfinite(masked_rows).all():
+                bad = torch.where(~torch.isfinite(masked_rows))
+                failures.append(
+                    f"batch {batch_idx}: nonfinite at row {valid_m + int(bad[0][0])}, "
+                    f"col {int(bad[1][0])}"
+                )
+            if not torch.equal(masked_rows, torch.zeros_like(masked_rows)):
+                bad = torch.where(masked_rows != 0)
+                failures.append(
+                    f"batch {batch_idx}: nonzero at row {valid_m + int(bad[0][0])}, "
+                    f"col {int(bad[1][0])}, value {float(masked_rows[bad[0][0], bad[1][0]])}"
+                )
+    return failures
+
+
 def _dirty_mxfp8_padded_rows(
     a_torch: torch.Tensor,
     sfa_torch: torch.Tensor,
@@ -192,6 +213,231 @@ def test_mxfp8_masked_gemm_padded_rows_do_not_change_valid_rows():
         "masked output rows finite: "
         f"{_masked_rows_are_finite(dirty_logical, masked_m)}"
     )
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+def test_mxfp8_zero_masked_output_clears_padded_rows():
+    torch.manual_seed(1234)
+    device = torch.device("cuda:0")
+    _requires_sm100_or_sm103(device)
+
+    l, m, k, n = 2, 256, 128, 128
+    ab_dtype = "float8_e4m3fn"
+    sf_dtype = "float8_e8m0fnu"
+    c_dtype = "bfloat16"
+    sf_vec_size = 32
+    masked_m = torch.tensor([96, 33], dtype=torch.int32, device=device)
+
+    a_ref = cutlass_torch.matrix(l, m, k, False, cutlass.Float32, device=device)
+    b_ref = cutlass_torch.matrix(l, n, k, False, cutlass.Float32, device=device)
+    _, a_torch = cutlass_torch.cute_tensor_like(
+        a_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, b_torch = cutlass_torch.cute_tensor_like(
+        b_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, _, clean_sfa = create_scale_factor_tensor(
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+    _, _, sfb_torch = create_scale_factor_tensor(
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+
+    dirty_a, dirty_sfa = _dirty_mxfp8_padded_rows(a_torch, clean_sfa, masked_m)
+    clean_ref = cutlass_torch.matrix(l, m, n, False, cutlass.Float32, device=device)
+    dirty_ref = cutlass_torch.matrix(l, m, n, False, cutlass.Float32, device=device)
+    clean_c_tensor, clean_out = cutlass_torch.cute_tensor_like(
+        clean_ref,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    dirty_c_tensor, dirty_out = cutlass_torch.cute_tensor_like(
+        dirty_ref,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    clean_out.fill_(float("nan"))
+    dirty_out.fill_(float("nan"))
+
+    grouped_gemm_nt_masked(
+        (a_torch, clean_sfa),
+        (b_torch, sfb_torch),
+        clean_out,
+        masked_m,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+    )
+    grouped_gemm_nt_masked(
+        (dirty_a, dirty_sfa),
+        (b_torch, sfb_torch),
+        dirty_out,
+        masked_m,
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
+        sf_vec_size=sf_vec_size,
+        zero_masked_output=True,
+    )
+
+    clean_logical = _copy_cute_output_to_logical_rows(clean_c_tensor, clean_ref)
+    dirty_logical = _copy_cute_output_to_logical_rows(dirty_c_tensor, dirty_ref)
+
+    valid_row_failures = []
+    for batch_idx in range(l):
+        valid_m = int(masked_m[batch_idx].item())
+        try:
+            torch.testing.assert_close(
+                dirty_logical[:valid_m, :, batch_idx],
+                clean_logical[:valid_m, :, batch_idx],
+                atol=0,
+                rtol=0,
+            )
+        except AssertionError as err:
+            valid_row_failures.append(f"batch {batch_idx}: {err}")
+
+    assert not valid_row_failures, (
+        "zero_masked_output changed valid output rows\n"
+        + "\n".join(valid_row_failures)
+    )
+    zero_failures = _masked_rows_zero_failures(dirty_logical, masked_m)
+    assert not zero_failures, "\n".join(zero_failures)
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+def test_zero_masked_output_rejects_combine_fusion():
+    torch.manual_seed(1234)
+    device = torch.device("cuda:0")
+    _requires_sm100_or_sm103(device)
+
+    l, m, k, n = 1, 128, 128, 128
+    ab_dtype = "float8_e4m3fn"
+    sf_dtype = "float8_e8m0fnu"
+    c_dtype = "bfloat16"
+    sf_vec_size = 32
+    masked_m = torch.tensor([96], dtype=torch.int32, device=device)
+
+    a_ref = cutlass_torch.matrix(l, m, k, False, cutlass.Float32, device=device)
+    b_ref = cutlass_torch.matrix(l, n, k, False, cutlass.Float32, device=device)
+    _, a_torch = cutlass_torch.cute_tensor_like(
+        a_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, b_torch = cutlass_torch.cute_tensor_like(
+        b_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, _, sfa_torch = create_scale_factor_tensor(
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+    _, _, sfb_torch = create_scale_factor_tensor(
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+    _, out = cutlass_torch.cute_tensor_like(
+        cutlass_torch.matrix(l, m, n, False, cutlass.Float32, device=device),
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+
+    with pytest.raises(ValueError, match="zero_masked_output"):
+        grouped_gemm_nt_masked(
+            (a_torch, sfa_torch),
+            (b_torch, sfb_torch),
+            out,
+            masked_m,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size,
+            is_combine_fusion=True,
+            zero_masked_output=True,
+        )
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.parametrize(
+    "extra_kwargs",
+    [
+        {"is_swap_ab": True},
+        {"dst_signals": lambda device: torch.zeros(1, dtype=torch.int32, device=device)},
+    ],
+)
+def test_zero_masked_output_rejects_unsupported_modes(extra_kwargs):
+    torch.manual_seed(1234)
+    device = torch.device("cuda:0")
+    _requires_sm100_or_sm103(device)
+
+    l, m, k, n = 1, 128, 128, 128
+    ab_dtype = "float8_e4m3fn"
+    sf_dtype = "float8_e8m0fnu"
+    c_dtype = "bfloat16"
+    sf_vec_size = 32
+    masked_m = torch.tensor([96], dtype=torch.int32, device=device)
+
+    a_ref = cutlass_torch.matrix(l, m, k, False, cutlass.Float32, device=device)
+    b_ref = cutlass_torch.matrix(l, n, k, False, cutlass.Float32, device=device)
+    _, a_torch = cutlass_torch.cute_tensor_like(
+        a_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, b_torch = cutlass_torch.cute_tensor_like(
+        b_ref,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+    _, _, sfa_torch = create_scale_factor_tensor(
+        l, m, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+    _, _, sfb_torch = create_scale_factor_tensor(
+        l, n, k, sf_vec_size, get_cutlass_dtype(sf_dtype), device
+    )
+    _, out = cutlass_torch.cute_tensor_like(
+        cutlass_torch.matrix(l, m, n, False, cutlass.Float32, device=device),
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+
+    resolved_kwargs = {
+        key: value(device) if callable(value) else value
+        for key, value in extra_kwargs.items()
+    }
+    with pytest.raises(ValueError, match="zero_masked_output"):
+        grouped_gemm_nt_masked(
+            (a_torch, sfa_torch),
+            (b_torch, sfb_torch),
+            out,
+            masked_m,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            sf_vec_size=sf_vec_size,
+            zero_masked_output=True,
+            **resolved_kwargs,
+        )
 
 
 @pytest.mark.skipif(
