@@ -660,6 +660,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         is_combine_fusion: bool = False,
         is_swap_ab: bool = False,
         zero_masked_output: bool = False,
+        zero_masked_sfa: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -695,6 +696,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.is_combine_fusion = is_combine_fusion
         self.is_swap_ab = is_swap_ab
         self.zero_masked_output = zero_masked_output
+        self.zero_masked_sfa = zero_masked_sfa
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -1705,6 +1707,58 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         ab_pipeline.consumer_wait(
                             ab_consumer_state, peek_ab_full_status
                         )
+
+                        if cutlass.const_expr(self.zero_masked_sfa):
+                            sfa_stage_layout = cute.slice_(
+                                sfa_smem_layout_staged,
+                                (None, None, None, ab_consumer_state.index),
+                            )
+                            sfa_stage_bytes: cutlass.Constexpr = cute.size_in_bytes(
+                                self.sf_dtype, sfa_stage_layout
+                            )
+                            sfa_stage_ptr = cute.make_ptr(
+                                Uint8,
+                                sSFA.iterator.toint()
+                                + ab_consumer_state.index * sfa_stage_bytes,
+                                cute.AddressSpace.smem,
+                            )
+                            sfa_stage = cute.make_tensor(
+                                sfa_stage_ptr,
+                                cute.make_layout((sfa_stage_bytes,)),
+                            )
+                            lane_idx = tidx % self.threads_per_warp
+                            num_k_tiles: cutlass.Constexpr = cute.ceil_div(
+                                self.mma_tiler[2], 4
+                            )
+                            valid_m = tile_sched_params.masked_m[cur_tile_coord[2]]
+                            global_m_base = (
+                                cur_tile_coord[0] * self.mma_inst_shape_mnk[0]
+                            )
+                            for elem_idx in cutlass.range(
+                                lane_idx,
+                                sfa_stage_bytes,
+                                self.threads_per_warp,
+                                unroll=1,
+                            ):
+                                k4 = elem_idx % 4
+                                tmp = elem_idx // 4
+                                m4 = tmp % 4
+                                tmp = tmp // 4
+                                m32 = tmp % 32
+                                tmp = tmp // 32
+                                kt = tmp % num_k_tiles
+                                mt = tmp // num_k_tiles
+                                del k4, kt
+                                local_m = mt * 128 + m4 * 32 + m32
+                                global_m = global_m_base + local_m
+                                value = sfa_stage[elem_idx]
+                                if global_m >= valid_m or value == Uint8(0xFF):
+                                    sfa_stage[elem_idx] = Uint8(0)
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            cute.arch.barrier(
+                                barrier_id=self.cta_sync_bar_id,
+                                number_of_threads=self.threads_per_warp,
+                            )
 
                         #  Copy SFA/SFB from smem to tmem
                         s2t_stage_coord = (
@@ -2998,6 +3052,7 @@ class MaskedBatchedMatmulCuteDSL:
         is_combine_fusion: bool = False,
         is_swap_ab: bool = False,
         zero_masked_output: bool = False,
+        zero_masked_sfa: bool = False,
     ):
         self._m = m
         self._n = n
@@ -3018,6 +3073,7 @@ class MaskedBatchedMatmulCuteDSL:
         self._is_combine_fusion = is_combine_fusion
         self._is_swap_ab = is_swap_ab
         self._zero_masked_output = zero_masked_output
+        self._zero_masked_sfa = zero_masked_sfa
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,
             sf_dtype,
@@ -3201,6 +3257,7 @@ class MaskedBatchedMatmulCuteDSL:
             is_combine_fusion=self._is_combine_fusion,
             is_swap_ab=self._is_swap_ab,
             zero_masked_output=self._zero_masked_output,
+            zero_masked_sfa=self._zero_masked_sfa,
         )(
             a_tensor,
             b_tensor,
@@ -3245,6 +3302,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     is_combine_fusion: bool = False,
     is_swap_ab: bool = False,
     zero_masked_output: bool = False,
+    zero_masked_sfa: bool = False,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -3510,6 +3568,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             is_combine_fusion=is_combine_fusion,
             is_swap_ab=is_swap_ab,
             zero_masked_output=zero_masked_output,
+            zero_masked_sfa=zero_masked_sfa,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -3730,6 +3789,7 @@ def grouped_gemm_nt_masked(
     alpha = kwargs.pop("alpha", None)
     alpha_dtype = kwargs.pop("alpha_dtype", None)
     zero_masked_output = kwargs.pop("zero_masked_output", False)
+    zero_masked_sfa = kwargs.pop("zero_masked_sfa", False)
 
     assert len(kwargs) == 0, f"Unsupported kwargs: {kwargs}"
 
@@ -3741,6 +3801,10 @@ def grouped_gemm_nt_masked(
         raise ValueError("zero_masked_output=True is not supported with combine fusion")
     if zero_masked_output and is_swap_ab:
         raise ValueError("zero_masked_output=True is not supported with swapped A/B")
+    if zero_masked_sfa and is_combine_fusion:
+        raise ValueError("zero_masked_sfa=True is not supported with combine fusion")
+    if zero_masked_sfa and is_swap_ab:
+        raise ValueError("zero_masked_sfa=True is not supported with swapped A/B")
     if zero_masked_output and (
         dst_signals is not None
         or barrier_flag_local is not None
@@ -3796,6 +3860,7 @@ def grouped_gemm_nt_masked(
         is_combine_fusion=is_combine_fusion,
         is_swap_ab=is_swap_ab,
         zero_masked_output=zero_masked_output,
+        zero_masked_sfa=zero_masked_sfa,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
