@@ -2610,12 +2610,12 @@ def _pack_trtllm_gen_spec_dec_mask(
     (batch_size, q_len_per_req) and the packing kernel is CUDA-graph
     capturable.
 
-    ``window_left >= 0`` selects the compatibility fallback layout: the
-    sliding window is folded into the packed mask, the kernel-side window is
-    disabled, and the mask region covers the whole presented KV range sized
-    by ``max_seq_len``. Native ``SlidingWindowCustom`` kernels pass
-    ``window_left=-1`` here so the packed mask is tail-only and the kernel
-    applies the window analytically.
+    ``window_left >= 0`` folds the sliding window into the packed mask and
+    makes the mask region cover the whole presented KV range sized by
+    ``max_seq_len``. Older artifacts then run with the kernel-side window
+    disabled. Native ``SlidingWindowCustom`` artifacts keep the kernel-side
+    window metadata too, but still use the explicit mask so old prefix tokens
+    are not implicitly visible before firstSparseMaskOffsetKv.
     """
     if q_len_per_req is None or q_len_per_req <= 1:
         raise ValueError(
@@ -3083,13 +3083,18 @@ def trtllm_batch_decode_with_kv_cache(
                     uses_shared_paged_kv_idx,
                 )
             )
-            mask_pack_window_left = -1 if custom_mask_uses_sliding_window else window_left
+            mask_pack_window_left = window_left
             force_spec_dec_tree_keeps = _should_force_trtllm_gen_spec_dec_tree_keeps(
                 spec_dec_tree_layout,
                 seq_lens,
                 q_len_per_req,
                 mask_pack_window_left,
             )
+            if custom_mask_uses_sliding_window:
+                # Keep the explicit folded window in the packed mask so old prefix tokens are not
+                # implicitly visible before firstSparseMaskOffsetKv. The native mask type still
+                # lets TRTLLM-GEN apply its tile/window predicates over the same visible range.
+                force_spec_dec_tree_keeps = True
             packed_custom_mask, custom_mask_offsets, first_sparse_mask_offsets_kv = (
                 _pack_trtllm_gen_spec_dec_mask(
                     mask,

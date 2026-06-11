@@ -517,7 +517,7 @@ class TllmGenFmhaKernel {
       // The current total number of CTAs.
       int totalNumCtas = numCtasX * numCtasZ * numCtasY;
       // Disable the multiCtasKvMode if there is only one CtaKv.
-      if (numCtasPerSeqKv <= 1) {
+      if (numCtasPerSeqKv <= 1 && !isCustomMask(selectKernelParams.mMaskType)) {
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
         // Enable the persistent scheduler for better performance.
         selectKernelParams.mTileScheduler = TileScheduler::Persistent;
