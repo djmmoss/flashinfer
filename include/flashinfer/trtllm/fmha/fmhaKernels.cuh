@@ -123,22 +123,6 @@ class TllmGenFmhaKernel {
     for (unsigned int i = 0; i < mKernelMetaCount; ++i) {
       auto const& kernelMeta = mKernelMeta[i];
       IKL_LOG_DEBUG("Checking tllmgen attention kernel %s", kernelMeta.mFuncName);
-      // The BF16Q+FP8KV K-only-transform kernels are an opt-in feature that is
-      // not wired up here yet; they share hash keys with the default
-      // full-transform kernels, so skip them at load.
-      if (kernelMeta.mEnablesBf16QFp8KvKOnlyTransform) {
-        continue;
-      }
-      // Mixed-dtype SwapsMmaAb generation kernels ship in both
-      // groupsTokensHeadsQ variants since the BF16Q+FP8KV full-transform
-      // rework; the token-grouping variant needs selection heuristics that
-      // are not wired up here yet and shares hash keys with the non-grouping
-      // one, so skip it at load (matches the previous artifact's inventory).
-      if (kernelMeta.mGroupsTokensHeadsQ &&
-          kernelMeta.mKernelType == static_cast<int>(FmhaKernelType::SwapsMmaAbForGeneration) &&
-          kernelMeta.mDataTypeQ != kernelMeta.mDataTypeK) {
-        continue;
-      }
       if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ &&
           kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV &&
           kernelMeta.mDataTypeO == mDtypeOut &&
@@ -175,7 +159,9 @@ class TllmGenFmhaKernel {
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
-                         int sparseMlaType, bool skipsSoftmax) const {
+                         int sparseMlaType, bool skipsSoftmax,
+                         bool enablesBf16QFp8KvKOnlyTransform,
+                         bool groupsTokensHeadsQ) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -208,6 +194,8 @@ class TllmGenFmhaKernel {
     // Bit 55 - 56: sparseMlaType (0=none, 1=static token sparse, 2=dynamic token sparse).
     // Bit 57 - 57: skipsSoftmax.
     // Bit 58 - 58: dynamicNumTokensPerPage.
+    // Bit 59 - 59: enablesBf16QFp8KvKOnlyTransform.
+    // Bit 60 - 60: groupsTokensHeadsQ.
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
@@ -222,7 +210,9 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(uses2CtaMma) << 54) |
            (static_cast<uint64_t>(sparseMlaType) << 55) |
            (static_cast<uint64_t>(skipsSoftmax) << 57) |
-           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58);
+           (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58) |
+           (static_cast<uint64_t>(enablesBf16QFp8KvKOnlyTransform) << 59) |
+           (static_cast<uint64_t>(groupsTokensHeadsQ) << 60);
   }
 
   inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
@@ -237,7 +227,8 @@ class TllmGenFmhaKernel {
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
                   isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
                   kernelMeta.m2CtaMma, kernelMeta.mSparseAttn,
-                  kernelMeta.mSkipsSoftmaxWhenPossible);
+                  kernelMeta.mSkipsSoftmaxWhenPossible,
+                  kernelMeta.mEnablesBf16QFp8KvKOnlyTransform, kernelMeta.mGroupsTokensHeadsQ);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -755,6 +746,7 @@ class TllmGenFmhaKernel {
     // The copy of the selectKernelParams, which makes sure it won't modify the original
     // selectKernelParams when computing the number of CTAs.
     SelectKernelParams selectKernelParamsCopy = selectKernelParams;
+    selectKernelParamsCopy.mGroupsTokensHeadsQ = true;
     // Load the kernel.
     auto [func, kernelMeta] = loadKernel(params, selectKernelParamsCopy);
     // Compute numCtasX, numCtasY and numCtasZ.
@@ -793,6 +785,7 @@ class TllmGenFmhaKernel {
       } else {
         selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       }
+      selectKernelParamsCopy.mGroupsTokensHeadsQ = true;
 
       // Load the kernel.
       std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
@@ -834,6 +827,7 @@ class TllmGenFmhaKernel {
     } else {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
     }
+    selectKernelParams.mGroupsTokensHeadsQ = true;
   }
 
   // Selects a heuristic kernel for GQA generation.
@@ -848,6 +842,7 @@ class TllmGenFmhaKernel {
     if (mDtypeQ != mDtypeK || mDtypeQ != mDtypeV) {
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
       return;
     }
 
@@ -857,24 +852,31 @@ class TllmGenFmhaKernel {
     if (numTokensHeadsQ <= 8) {
       tileSizeQ = 8;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 16) {
       tileSizeQ = 16;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 32) {
       tileSizeQ = 32;
       kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 64) {
       tileSizeQ = 64;
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = params.mMaxSeqLenQ > 1;
     } else {
       tileSizeQ = 128;
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      selectKernelParams.mGroupsTokensHeadsQ = params.mMaxSeqLenQ > 1;
     }
 
     // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
     // groups both tokensQ and headsQ into one CTA.
     if (params.mMaxSeqLenQ > 1) {
       selectTileSizeQForGqaGeneration(params, selectKernelParams);
+    } else {
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     }
   }
 
@@ -909,18 +911,23 @@ class TllmGenFmhaKernel {
     if (params.mForceSpecDecTreeKeeps) {
       selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 128;
+      selectKernelParams.mGroupsTokensHeadsQ = true;
     } else if (numTokensHeadsQ <= 8) {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 8;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 16) {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 16;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else if (numTokensHeadsQ <= 64) {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 32;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
     } else {
       selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       selectKernelParams.mTileSizeQ = 128;
+      selectKernelParams.mGroupsTokensHeadsQ = true;
     }
     selectKernelParams.mTileSizeKv = 128;
     selectKernelParams.mForceGmemReduction = true;
@@ -952,6 +959,10 @@ class TllmGenFmhaKernel {
       } else {
         selectGqGenerationKernel(params, selectKernelParams);
       }
+    }
+    if (!isCustomMask(selectKernelParams.mMaskType) &&
+        isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType)) {
+      selectKernelParams.mGroupsTokensHeadsQ = true;
     }
 
     // For headDimV > 256, set headDimPerCtaV to 256 for context and keepsMmaAbForGeneration
@@ -998,7 +1009,10 @@ class TllmGenFmhaKernel {
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma) +
         ", sparseMlaType=" + std::to_string(static_cast<int>(params.mSparseMlaType)) +
-        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
+        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) +
+        ", enablesBf16QFp8KvKOnlyTransform=" +
+        std::to_string(selectKernelParams.mEnablesBf16QFp8KvKOnlyTransform) +
+        ", groupsTokensHeadsQ=" + std::to_string(selectKernelParams.mGroupsTokensHeadsQ);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1014,7 +1028,9 @@ class TllmGenFmhaKernel {
                selectKernelParams.mNumTokensPerPage, selectKernelParams.mDynamicNumTokensPerPage,
                selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
                static_cast<int>(params.mSparseMlaType),
-               selectKernelParams.mSkipsSoftmaxWhenPossible),
+               selectKernelParams.mSkipsSoftmaxWhenPossible,
+               selectKernelParams.mEnablesBf16QFp8KvKOnlyTransform,
+               selectKernelParams.mGroupsTokensHeadsQ),
         info);
   }
 
