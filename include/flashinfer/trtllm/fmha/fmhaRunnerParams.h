@@ -428,6 +428,8 @@ struct TllmGenSelectKernelParams {
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
   bool mUses2CtaMma;
+  // Whether the selected generation kernel groups tokensQ and headsQ into one CTA.
+  bool mGroupsTokensHeadsQ;
 
   // The constructor.
   TllmGenSelectKernelParams(TllmGenFmhaRunnerParams params)
@@ -447,5 +449,6 @@ struct TllmGenSelectKernelParams {
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
-        mUses2CtaMma(false) {};
+        mUses2CtaMma(false),
+        mGroupsTokensHeadsQ(false) {};
 };
