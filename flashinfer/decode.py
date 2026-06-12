@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 import warnings
 from types import SimpleNamespace
 from typing import Any, List, Literal, NamedTuple, Optional, Tuple, Union, overload
@@ -2550,6 +2551,11 @@ def _should_force_trtllm_gen_spec_dec_tree_keeps(
 ) -> bool:
     if layout.kernel_layout != "swaps":
         return False
+    if os.environ.get("FLASHINFER_TRTLLM_GEN_SPEC_DEC_TREE_ENABLE_SWAPS") != "1":
+        # Swaps custom-mask support is kept available for explicit benchmarking, but B300
+        # measurements on the initial artifact showed the small verify shapes regressing versus
+        # Keeps. Keep the public default conservative until there is a measured winning boundary.
+        return True
     if window_left >= 0:
         return True
     tile_size_kv_per_cta = 128 * layout.num_insts_kv
