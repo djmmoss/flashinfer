@@ -1064,6 +1064,23 @@ def assert_spec_states(
 # ------------------------------------------------------------------------------
 
 
+def force_chunk_major_kernel(monkeypatch):
+    import importlib
+
+    recurrent_kda_backend = importlib.import_module(
+        "flashinfer.kda_kernels.recurrent_kda"
+    )
+    get_compiled_kernel = recurrent_kda_backend._get_compiled_kernel
+
+    def get_chunk_major_kernel(*args):
+        return get_compiled_kernel(*args[:-1], 1)
+
+    monkeypatch.setenv("KDA_USE_VTILE", "0")
+    monkeypatch.setattr(
+        recurrent_kda_backend, "_get_compiled_kernel", get_chunk_major_kernel
+    )
+
+
 @pytest.mark.parametrize(
     (
         "N",
@@ -1083,6 +1100,26 @@ def assert_spec_states(
         pytest.param(8, 16, 16, 128, 2, False, False, id="N8-H16-D128-S2-no-qk-l2"),
         pytest.param(4, 4, 8, 64, 2, True, False, id="N4-H4-HV8-D64-S2-GQA"),
         pytest.param(4, 8, 8, 128, 3, True, True, id="N4-H8-D128-S3-chunk-major"),
+        pytest.param(
+            4,
+            8,
+            8,
+            128,
+            3,
+            False,
+            True,
+            id="N4-H8-D128-S3-chunk-major-no-qk-l2",
+        ),
+        pytest.param(
+            4,
+            4,
+            8,
+            128,
+            3,
+            True,
+            True,
+            id="N4-H4-HV8-D128-S3-GQA-chunk-major",
+        ),
     ],
 )
 def test_spec_decode_basic(
@@ -1100,25 +1137,20 @@ def test_spec_decode_basic(
     device = torch.device("cuda")
 
     if use_chunk_major:
-        import importlib
-
-        recurrent_kda_backend = importlib.import_module(
-            "flashinfer.kda_kernels.recurrent_kda"
-        )
-
-        get_compiled_kernel = recurrent_kda_backend._get_compiled_kernel
-
-        def get_chunk_major_kernel(*args):
-            return get_compiled_kernel(*args[:-1], 1)
-
-        monkeypatch.setenv("KDA_USE_VTILE", "0")
-        monkeypatch.setattr(
-            recurrent_kda_backend, "_get_compiled_kernel", get_chunk_major_kernel
-        )
+        force_chunk_major_kernel(monkeypatch)
 
     q, k, v, g, beta, cu_seqlens, ssm_state_indices, state_pool, scale, T = (
         make_spec_decode_inputs(N, H, HV, D, num_spec_tokens, device)
     )
+    if use_chunk_major and use_qk_l2norm_in_kernel:
+        v_columns = torch.arange(1, D + 1, device=device, dtype=torch.float32)
+        packed_tokens = torch.arange(
+            1, v.shape[1] + 1, device=device, dtype=torch.float32
+        )
+        v_pattern = packed_tokens.view(1, -1, 1, 1) * v_columns.view(
+            1, 1, 1, D
+        )
+        v.copy_((v_pattern / float(D * T)).expand_as(v).to(v.dtype))
 
     # Reference
     ref_out, ref_states = spec_decode_naive_reference(
@@ -1168,19 +1200,25 @@ def test_spec_decode_basic(
 
 
 @pytest.mark.parametrize(
-    "gate_mode",
+    ("gate_mode", "use_chunk_major"),
     [
-        pytest.param("precomputed", id="precomputed"),
-        pytest.param("softplus", id="softplus"),
-        pytest.param("lower_bound", id="lower_bound"),
+        pytest.param("precomputed", False, id="precomputed-base"),
+        pytest.param("softplus", False, id="softplus-base"),
+        pytest.param("lower_bound", False, id="lower-bound-base"),
+        pytest.param("precomputed", True, id="precomputed-chunk-major"),
+        pytest.param("softplus", True, id="softplus-chunk-major"),
+        pytest.param("lower_bound", True, id="lower-bound-chunk-major"),
     ],
 )
-def test_spec_decode_gate_modes(gate_mode):
-    """All 3 gate modes work correctly with spec decode."""
+def test_spec_decode_gate_modes(gate_mode, use_chunk_major, monkeypatch):
+    """All gate modes work on ordinary and T4 chunk-major spec decode."""
     torch.manual_seed(42)
     device = torch.device("cuda")
-    N, H, HV, D, num_spec_tokens = 4, 16, 16, 128, 2
+    num_spec_tokens = 3 if use_chunk_major else 2
+    N, H, HV, D = 4, 16, 16, 128
     dtype = torch.bfloat16
+    if use_chunk_major:
+        force_chunk_major_kernel(monkeypatch)
 
     q, k, v, g, beta, cu_seqlens, ssm_state_indices, state_pool, scale, T = (
         make_spec_decode_inputs(N, H, HV, D, num_spec_tokens, device, dtype)
