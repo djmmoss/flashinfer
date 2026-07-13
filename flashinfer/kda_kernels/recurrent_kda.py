@@ -1257,12 +1257,12 @@ def recurrent_kda_decode_chunk_major_kernel(
                     HEAD_DIM,
                     USE_QK_L2NORM,
                 )
-            cute.arch.sync_threads()
-            v_sh[tidx] = v_head[tidx].to(cutlass.Float32)
+            if tidx < HEAD_DIM // 2:
+                v_idx = v_offset_a + tidx
+                v_sh[v_idx] = v_head[v_idx].to(cutlass.Float32)
 
             if token_t == 0:
                 nvvm.cp_async_wait_group(1)
-                cute.arch.sync_threads()
 
             compute_gate_to_smem(
                 g_sh,
