@@ -1091,7 +1091,7 @@ def force_chunk_major_kernel(monkeypatch):
     get_compiled_kernel = recurrent_kda_backend._get_compiled_kernel
 
     def get_chunk_major_kernel(*args):
-        return get_compiled_kernel(*args[:-1], 1)
+        return get_compiled_kernel(*args[:-2], 1, args[-1])
 
     monkeypatch.setenv("KDA_USE_VTILE", "0")
     monkeypatch.setattr(

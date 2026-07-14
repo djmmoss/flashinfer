@@ -658,6 +658,7 @@ def recurrent_kda_decode_kernel(
     USE_LOWER_BOUND: cutlass.Constexpr[int],
     USE_CU_SEQLENS: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
+    USE_2D_GRID: cutlass.Constexpr[int],
 ):
     """Multi-token spec-decode kernel. One CTA per (batch, head) pair.
 
@@ -670,14 +671,19 @@ def recurrent_kda_decode_kernel(
     2 ping-pong H SMEM buffers; K/G/Q read from SMEM (broadcast).
     """
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
+    bidx_x, bidx_y, _ = cute.arch.block_idx()
 
     HV = cutlass.Int32(gV.shape[2])
     H = cutlass.Int32(gQ.shape[2])
-
-    batch_idx = bidx // HV
-    value_head_idx = bidx % HV
-    query_head_idx = value_head_idx // (HV // H)
+    if cutlass.const_expr(USE_2D_GRID == 1):
+        value_head_idx = bidx_x
+        batch_idx = bidx_y
+    else:
+        batch_idx = bidx_x // HV
+        value_head_idx = bidx_x % HV
+    query_head_idx = value_head_idx
+    if H != HV:
+        query_head_idx = value_head_idx // (HV // H)
 
     # cu_seqlens base offset (zero cost when USE_CU_SEQLENS=0)
     token_base_offset = cutlass.Int32(0)
@@ -1138,16 +1144,23 @@ def recurrent_kda_decode_chunk_major_kernel(
     USE_LOWER_BOUND: cutlass.Constexpr[int],
     USE_CU_SEQLENS: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
+    USE_2D_GRID: cutlass.Constexpr[int],
 ):
     """D128 T=4 base kernel with V-chunk-outer, token-inner traversal."""
     tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
+    bidx_x, bidx_y, _ = cute.arch.block_idx()
 
     HV = cutlass.Int32(gV.shape[2])
     H = cutlass.Int32(gQ.shape[2])
-    batch_idx = bidx // HV
-    value_head_idx = bidx % HV
-    query_head_idx = value_head_idx // (HV // H)
+    if cutlass.const_expr(USE_2D_GRID == 1):
+        value_head_idx = bidx_x
+        batch_idx = bidx_y
+    else:
+        batch_idx = bidx_x // HV
+        value_head_idx = bidx_x % HV
+    query_head_idx = value_head_idx
+    if H != HV:
+        query_head_idx = value_head_idx // (HV // H)
 
     token_base_offset = cutlass.Int32(0)
     seq_len = cutlass.Int32(1)
@@ -1689,6 +1702,7 @@ def recurrent_kda_launch(
     USE_CU_SEQLENS: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
     USE_CHUNK_MAJOR: cutlass.Constexpr[int],
+    USE_2D_GRID: cutlass.Constexpr[int],
 ):
     batch_size = mQ.shape[0]
     if USE_CU_SEQLENS == 1:
@@ -1699,6 +1713,11 @@ def recurrent_kda_launch(
         kernel = recurrent_kda_decode_chunk_major_kernel
     else:
         kernel = recurrent_kda_decode_kernel
+
+    if cutlass.const_expr(USE_2D_GRID == 1):
+        grid = [HV, batch_size, 1]
+    else:
+        grid = [batch_size * HV, 1, 1]
 
     kernel(
         mQ,
@@ -1723,8 +1742,9 @@ def recurrent_kda_launch(
         USE_LOWER_BOUND,
         USE_CU_SEQLENS,
         NUM_TOKENS,
+        USE_2D_GRID,
     ).launch(
-        grid=[batch_size * HV, 1, 1],
+        grid=grid,
         block=[HEAD_DIM, 1, 1],
         stream=stream,
     )
@@ -1861,6 +1881,11 @@ _dummy_cache = {}  # device -> dict of pre-allocated dummy tensors
 _num_sms_cache = {}  # device -> int, SM count (used by auto-dispatch)
 # Keeps the D128 spec-decode vtile kernel within the tuned occupancy/register budget.
 _VTILE_SPEC_D128_MAXRREGCOUNT = 72
+_MAX_GRID_DIM_Y = 65_535
+
+
+def _can_use_2d_grid(batch_size):
+    return batch_size <= _MAX_GRID_DIM_Y
 
 
 def _get_num_sms(device):
@@ -1881,6 +1906,7 @@ def _get_compiled_kernel(
     USE_CU_SEQLENS,
     NUM_TOKENS=1,
     USE_CHUNK_MAJOR=0,
+    USE_2D_GRID=1,
 ):
     """Cache compiled kernel for given configuration."""
     B, H, HV, N = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -1949,6 +1975,7 @@ def _get_compiled_kernel(
         USE_CU_SEQLENS,
         NUM_TOKENS,
         USE_CHUNK_MAJOR,
+        USE_2D_GRID,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
@@ -2414,6 +2441,7 @@ def run_recurrent_kda(
     if cu_seqlens is None:
         NUM_TOKENS = 1
     grid_seqs = cu_seqlens_i32.shape[0] - 1 if cu_seqlens_i32 is not None else B
+    use_2d_grid = _can_use_2d_grid(grid_seqs)
     base_grid = grid_seqs * HV
     # Dispatch between the base and v-tiled kernels.
     #   - base:  grid = B*HV, one CTA per (batch, head), SMEM ping-pong over V chunks.
@@ -2482,6 +2510,7 @@ def run_recurrent_kda(
             USE_CU,
             NUM_TOKENS,
             int(use_chunk_major),
+            int(use_2d_grid),
         )
 
     # Dummy tensors for unused optional args (TVM FFI requires all args present)
