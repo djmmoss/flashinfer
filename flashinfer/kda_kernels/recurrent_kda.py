@@ -2167,6 +2167,9 @@ def run_recurrent_kda(
     num_spec_tokens: Optional[int] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    *,
+    _force_chunk_major: Optional[bool] = None,
+    _force_2d_grid: Optional[bool] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Key-Driven Attention) decode kernel.
 
@@ -2450,6 +2453,8 @@ def run_recurrent_kda(
         NUM_TOKENS = 1
     grid_seqs = cu_seqlens_i32.shape[0] - 1 if cu_seqlens_i32 is not None else B
     use_2d_grid = _can_use_2d_grid(grid_seqs)
+    if _force_2d_grid is not None:
+        use_2d_grid = _force_2d_grid
     base_grid = grid_seqs * HV
     # Dispatch between the base and v-tiled kernels.
     #   - base:  grid = B*HV, one CTA per (batch, head), SMEM ping-pong over V chunks.
@@ -2465,7 +2470,9 @@ def run_recurrent_kda(
     # A register-resident ILP MTP port was evaluated and rejected in the
     # original kda-cutedsl tuning notes.
     _vtile_env = os.environ.get("KDA_USE_VTILE")
-    if _vtile_env == "1":
+    if _force_chunk_major is not None:
+        use_vtile = False
+    elif _vtile_env == "1":
         use_vtile = True
     elif _vtile_env == "0":
         use_vtile = False
@@ -2508,7 +2515,11 @@ def run_recurrent_kda(
                 V_TILE_ROWS,
             )
     else:
-        use_chunk_major = K == 128 and NUM_TOKENS == 4 and base_grid >= 2048
+        use_chunk_major = (
+            K == 128 and NUM_TOKENS == 4 and base_grid >= 2048
+            if _force_chunk_major is None
+            else _force_chunk_major
+        )
         compiled = _get_compiled_kernel(
             K,
             USE_QK_NORM,

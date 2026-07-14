@@ -9,10 +9,12 @@ from flashinfer.utils import is_sm100a_supported
 
 try:
     from flashinfer.kda_decode import _RECURRENT_KDA_AVAILABLE, recurrent_kda
+    from flashinfer.kda_kernels.recurrent_kda import run_recurrent_kda
 
     _has_recurrent_kda = _RECURRENT_KDA_AVAILABLE
 except ImportError:
     recurrent_kda = None
+    run_recurrent_kda = None
     _has_recurrent_kda = False
 
 try:
@@ -1082,23 +1084,6 @@ def assert_spec_states(
 # ------------------------------------------------------------------------------
 
 
-def force_chunk_major_kernel(monkeypatch):
-    import importlib
-
-    recurrent_kda_backend = importlib.import_module(
-        "flashinfer.kda_kernels.recurrent_kda"
-    )
-    get_compiled_kernel = recurrent_kda_backend._get_compiled_kernel
-
-    def get_chunk_major_kernel(*args):
-        return get_compiled_kernel(*args[:-3], 1, *args[-2:])
-
-    monkeypatch.setenv("KDA_USE_VTILE", "0")
-    monkeypatch.setattr(
-        recurrent_kda_backend, "_get_compiled_kernel", get_chunk_major_kernel
-    )
-
-
 @pytest.mark.parametrize(
     (
         "N",
@@ -1148,14 +1133,12 @@ def test_spec_decode_basic(
     num_spec_tokens,
     use_qk_l2norm_in_kernel,
     use_chunk_major,
-    monkeypatch,
+    force_base=False,
+    force_2d_grid=None,
 ):
     """Single spec-decode call matches T sequential naive calls."""
     torch.manual_seed(42)
     device = torch.device("cuda")
-
-    if use_chunk_major:
-        force_chunk_major_kernel(monkeypatch)
 
     q, k, v, g, beta, cu_seqlens, ssm_state_indices, state_pool, scale, T = (
         make_spec_decode_inputs(N, H, HV, D, num_spec_tokens, device)
@@ -1189,7 +1172,8 @@ def test_spec_decode_basic(
 
     # Kernel
     tri_state_pool = state_pool.clone()
-    tri_out, _ = recurrent_kda(
+    force_chunk_major = False if force_base else (True if use_chunk_major else None)
+    tri_out, _ = run_recurrent_kda(
         q=q,
         k=k,
         v=v,
@@ -1201,6 +1185,8 @@ def test_spec_decode_basic(
         ssm_state_indices=ssm_state_indices,
         num_spec_tokens=num_spec_tokens,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        _force_chunk_major=force_chunk_major,
+        _force_2d_grid=force_2d_grid,
     )
 
     # Output comparison
@@ -1212,17 +1198,18 @@ def test_spec_decode_basic(
     )
 
 
-def test_recurrent_kda_1d_grid_fallback(monkeypatch):
-    import importlib
-
-    recurrent_kda_backend = importlib.import_module(
-        "flashinfer.kda_kernels.recurrent_kda"
+def test_recurrent_kda_1d_grid_fallback():
+    test_spec_decode_basic(
+        4,
+        8,
+        8,
+        64,
+        1,
+        True,
+        False,
+        force_base=True,
+        force_2d_grid=False,
     )
-    monkeypatch.setattr(
-        recurrent_kda_backend, "_can_use_2d_grid", lambda _: False
-    )
-    monkeypatch.setenv("KDA_USE_VTILE", "0")
-    test_spec_decode_basic(4, 8, 8, 64, 1, True, False, monkeypatch)
 
 
 # ------------------------------------------------------------------------------
@@ -1241,16 +1228,13 @@ def test_recurrent_kda_1d_grid_fallback(monkeypatch):
         pytest.param("lower_bound", True, id="lower-bound-chunk-major"),
     ],
 )
-def test_spec_decode_gate_modes(gate_mode, use_chunk_major, monkeypatch):
+def test_spec_decode_gate_modes(gate_mode, use_chunk_major):
     """All gate modes work on ordinary and T4 chunk-major spec decode."""
     torch.manual_seed(42)
     device = torch.device("cuda")
     num_spec_tokens = 3 if use_chunk_major else 2
     N, H, HV, D = 4, 16, 16, 128
     dtype = torch.bfloat16
-    if use_chunk_major:
-        force_chunk_major_kernel(monkeypatch)
-
     q, k, v, g, beta, cu_seqlens, ssm_state_indices, state_pool, scale, T = (
         make_spec_decode_inputs(N, H, HV, D, num_spec_tokens, device, dtype)
     )
@@ -1300,7 +1284,7 @@ def test_spec_decode_gate_modes(gate_mode, use_chunk_major, monkeypatch):
     )
 
     tri_state_pool = state_pool.clone()
-    tri_out, _ = recurrent_kda(
+    tri_out, _ = run_recurrent_kda(
         q=q,
         k=k,
         v=v,
@@ -1315,6 +1299,7 @@ def test_spec_decode_gate_modes(gate_mode, use_chunk_major, monkeypatch):
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        _force_chunk_major=True if use_chunk_major else None,
     )
 
     assert_close(
