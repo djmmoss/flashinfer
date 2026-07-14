@@ -128,6 +128,24 @@ def maybe_l2norm(x: torch.Tensor, enabled: bool) -> torch.Tensor:
 # Tests
 # ==============================================================================
 
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected"),
+    [
+        pytest.param(1, True, id="small"),
+        pytest.param(65_535, True, id="grid-y-limit"),
+        pytest.param(65_536, False, id="grid-y-overflow"),
+    ],
+)
+def test_recurrent_kda_2d_grid_limit(batch_size, expected):
+    import importlib
+
+    recurrent_kda_backend = importlib.import_module(
+        "flashinfer.kda_kernels.recurrent_kda"
+    )
+    assert recurrent_kda_backend._can_use_2d_grid(batch_size) is expected
+
+
 # Shared configs for vs_naive and vs_fla tests: (B, T, H, D, scale, norm, qk_l2, dtype)
 _VS_REFERENCE_CONFIGS = [
     (1, 1, 4, 64, 1, 1, True, torch.bfloat16),
@@ -1192,6 +1210,19 @@ def test_spec_decode_basic(
     assert_spec_states(
         tri_state_pool, ssm_state_indices, ref_states, N, T, atol=1e-1, rtol=5e-2
     )
+
+
+def test_recurrent_kda_1d_grid_fallback(monkeypatch):
+    import importlib
+
+    recurrent_kda_backend = importlib.import_module(
+        "flashinfer.kda_kernels.recurrent_kda"
+    )
+    monkeypatch.setattr(
+        recurrent_kda_backend, "_can_use_2d_grid", lambda _: False
+    )
+    monkeypatch.setenv("KDA_USE_VTILE", "0")
+    test_spec_decode_basic(4, 8, 8, 64, 1, True, False, monkeypatch)
 
 
 # ------------------------------------------------------------------------------
