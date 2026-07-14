@@ -446,8 +446,8 @@ def compute_gate_to_smem(
             ag = mlir_arith.mulf(neg_A_ir, g_val.ir_value(), fastmath=fm)
             exp_neg = mlir_math.exp2(ag, fastmath=fm)
             denom = mlir_arith.addf(one_ir, exp_neg, fastmath=fm)
-            sig = mlir_arith.divf(one_ir, denom, fastmath=fm)
-            ls = mlir_arith.mulf(lb_ir, sig, fastmath=fm)
+            sig = cute.arch.rcp_approx(cutlass.Float32(denom))
+            ls = mlir_arith.mulf(lb_ir, sig.ir_value(), fastmath=fm)
             g_val = mlir_math.exp2(ls, fastmath=fm)
         else:
             exp_g = cute.exp(g_val, fastmath=True)
