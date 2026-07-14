@@ -659,6 +659,7 @@ def recurrent_kda_decode_kernel(
     USE_CU_SEQLENS: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
     USE_2D_GRID: cutlass.Constexpr[int],
+    USE_EQUAL_HEADS: cutlass.Constexpr[int],
 ):
     """Multi-token spec-decode kernel. One CTA per (batch, head) pair.
 
@@ -674,15 +675,16 @@ def recurrent_kda_decode_kernel(
     bidx_x, bidx_y, _ = cute.arch.block_idx()
 
     HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
     if cutlass.const_expr(USE_2D_GRID == 1):
         value_head_idx = bidx_x
         batch_idx = bidx_y
     else:
         batch_idx = bidx_x // HV
         value_head_idx = bidx_x % HV
-    query_head_idx = value_head_idx
-    if H != HV:
+    if cutlass.const_expr(USE_EQUAL_HEADS == 1):
+        query_head_idx = value_head_idx
+    else:
+        H = cutlass.Int32(gQ.shape[2])
         query_head_idx = value_head_idx // (HV // H)
 
     # cu_seqlens base offset (zero cost when USE_CU_SEQLENS=0)
@@ -1145,21 +1147,23 @@ def recurrent_kda_decode_chunk_major_kernel(
     USE_CU_SEQLENS: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
     USE_2D_GRID: cutlass.Constexpr[int],
+    USE_EQUAL_HEADS: cutlass.Constexpr[int],
 ):
     """D128 T=4 base kernel with V-chunk-outer, token-inner traversal."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx_x, bidx_y, _ = cute.arch.block_idx()
 
     HV = cutlass.Int32(gV.shape[2])
-    H = cutlass.Int32(gQ.shape[2])
     if cutlass.const_expr(USE_2D_GRID == 1):
         value_head_idx = bidx_x
         batch_idx = bidx_y
     else:
         batch_idx = bidx_x // HV
         value_head_idx = bidx_x % HV
-    query_head_idx = value_head_idx
-    if H != HV:
+    if cutlass.const_expr(USE_EQUAL_HEADS == 1):
+        query_head_idx = value_head_idx
+    else:
+        H = cutlass.Int32(gQ.shape[2])
         query_head_idx = value_head_idx // (HV // H)
 
     token_base_offset = cutlass.Int32(0)
@@ -1703,6 +1707,7 @@ def recurrent_kda_launch(
     NUM_TOKENS: cutlass.Constexpr[int],
     USE_CHUNK_MAJOR: cutlass.Constexpr[int],
     USE_2D_GRID: cutlass.Constexpr[int],
+    USE_EQUAL_HEADS: cutlass.Constexpr[int],
 ):
     batch_size = mQ.shape[0]
     if USE_CU_SEQLENS == 1:
@@ -1743,6 +1748,7 @@ def recurrent_kda_launch(
         USE_CU_SEQLENS,
         NUM_TOKENS,
         USE_2D_GRID,
+        USE_EQUAL_HEADS,
     ).launch(
         grid=grid,
         block=[HEAD_DIM, 1, 1],
@@ -1907,6 +1913,7 @@ def _get_compiled_kernel(
     NUM_TOKENS=1,
     USE_CHUNK_MAJOR=0,
     USE_2D_GRID=1,
+    USE_EQUAL_HEADS=0,
 ):
     """Cache compiled kernel for given configuration."""
     B, H, HV, N = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -1976,6 +1983,7 @@ def _get_compiled_kernel(
         NUM_TOKENS,
         USE_CHUNK_MAJOR,
         USE_2D_GRID,
+        USE_EQUAL_HEADS,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
@@ -2511,6 +2519,7 @@ def run_recurrent_kda(
             NUM_TOKENS,
             int(use_chunk_major),
             int(use_2d_grid),
+            int(H == HV),
         )
 
     # Dummy tensors for unused optional args (TVM FFI requires all args present)
