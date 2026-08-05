@@ -28,7 +28,11 @@ from typing import Literal, Optional
 import torch
 
 from .api_logging import flashinfer_api
-from .trace.templates.kda import fused_kda_decode_trace, recurrent_kda_trace
+from .trace.templates.kda import (
+    fused_kda_decode_packed_trace,
+    fused_kda_decode_trace,
+    recurrent_kda_trace,
+)
 
 try:
     from .kda_kernels.fused_kda_decode import (
@@ -39,6 +43,16 @@ try:
 except (ImportError, RuntimeError):
     _run_fused_kda_decode = None
     _FUSED_KDA_DECODE_AVAILABLE = False
+
+try:
+    from .kda_kernels.fused_kda_decode_multitoken import (
+        run_fused_kda_decode_multitoken as _run_fused_kda_decode_packed,
+    )
+
+    _FUSED_KDA_DECODE_PACKED_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _run_fused_kda_decode_packed = None
+    _FUSED_KDA_DECODE_PACKED_AVAILABLE = False
 
 from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
 
@@ -270,6 +284,77 @@ def fused_kda_decode(
     if _run_fused_kda_decode is None:
         raise NotImplementedError("fused KDA decode backend is unavailable")
     return _run_fused_kda_decode(
+        x=x,
+        weight=weight,
+        conv_state=conv_state,
+        raw_gate=raw_gate,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_indices=state_indices,
+        state=state,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        lower_bound=lower_bound,
+        norm_eps=norm_eps,
+        output=output,
+    )
+
+
+@flashinfer_api(trace=fused_kda_decode_packed_trace)
+def fused_kda_decode_packed(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    lower_bound: Optional[float] = -5.0,
+    norm_eps: float = 1e-5,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run packed T>=1 fused KDA with per-token cache checkpoints.
+
+    Tokens are sequence-major: token ``(n, t)`` is stored at row ``n*T+t``.
+    ``state_indices`` has shape ``[N, T]``. Its first slot is the source state
+    for the sequence and is overwritten by token zero; every subsequent token
+    consumes the preceding update and writes its own checkpoint. A sequence is
+    null when all of its indices are non-positive.
+
+    T=1 dispatches to :func:`fused_kda_decode`, including its bfloat16-state and
+    softplus-gate support. T>1 uses the experimental SM10x packed backend,
+    which currently requires FP32 recurrent state and a finite negative
+    ``lower_bound``. Both paths require head dimension 128, convolution width
+    four, and 12, 24, 32, 48, or 96 heads. Other tensors follow
+    :func:`fused_kda_decode`, with packed row count ``N*T`` instead of ``N``.
+    """
+    if state_indices.ndim == 2 and state_indices.shape[1] == 1:
+        if _run_fused_kda_decode is None:
+            raise NotImplementedError("fused KDA decode backend is unavailable")
+        return _run_fused_kda_decode(
+            x=x,
+            weight=weight,
+            conv_state=conv_state,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_indices=state_indices[:, 0],
+            state=state,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            lower_bound=lower_bound,
+            norm_eps=norm_eps,
+            output=output,
+        )
+    if _run_fused_kda_decode_packed is None:
+        raise NotImplementedError("packed fused KDA decode backend is unavailable")
+    return _run_fused_kda_decode_packed(
         x=x,
         weight=weight,
         conv_state=conv_state,

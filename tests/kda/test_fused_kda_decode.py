@@ -22,11 +22,13 @@ try:
     from flashinfer.kda_decode import (
         _FUSED_KDA_DECODE_AVAILABLE,
         fused_kda_decode,
+        fused_kda_decode_packed,
     )
 
     _has_fused_kda_decode = _FUSED_KDA_DECODE_AVAILABLE
 except ImportError:
     fused_kda_decode = None
+    fused_kda_decode_packed = None
     _has_fused_kda_decode = False
 
 
@@ -178,6 +180,70 @@ def _reference(inputs, conv_state, state, lower_bound=-5.0):
     return output.unsqueeze(0).to(torch.bfloat16)
 
 
+@torch.no_grad()
+def _packed_reference(inputs, conv_state, state):
+    indices = inputs["state_indices"]
+    num_sequences, num_tokens = indices.shape
+    num_heads = inputs["A_log"].numel()
+    hidden_size = num_heads * 128
+    taps = inputs["weight"].permute(0, 2, 1).reshape(3 * hidden_size, 4).float()
+    source_slots = indices[:, 0].clamp_min(0).long()
+    live = indices[:, 0] > 0
+    history = conv_state.index_select(0, source_slots).float()
+    current_state = state.index_select(0, source_slots).float()
+    output = torch.zeros(
+        (1, num_sequences * num_tokens, num_heads, 128),
+        dtype=torch.bfloat16,
+        device=state.device,
+    )
+    sequence_offsets = torch.arange(num_sequences, device=state.device) * num_tokens
+    decay_a = inputs["A_log"].exp().view(num_heads, 1)
+
+    for token in range(num_tokens):
+        rows = sequence_offsets + token
+        token_slots = indices[:, token]
+        live_slots = token_slots[live].long()
+        current_x = inputs["x"].index_select(0, rows).float()
+        window = torch.cat((history, current_x.unsqueeze(-1)), dim=-1)
+        history = window[:, :, 1:]
+        conv_state.index_copy_(0, live_slots, history[live].to(torch.bfloat16))
+
+        mixed = F.silu((window * taps.unsqueeze(0)).sum(-1)).to(torch.bfloat16)
+        query, key, value = (
+            mixed.float().view(num_sequences, 3, num_heads, 128).unbind(1)
+        )
+        query *= torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
+        query *= 128**-0.5
+        key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+        raw_gate = inputs["raw_gate"][0].index_select(0, rows).float()
+        raw_gate += inputs["dt_bias"].view(1, num_heads, 128)
+        decay = torch.exp(-5.0 * torch.sigmoid(decay_a.unsqueeze(0) * raw_gate))
+        current_state *= decay.unsqueeze(-2)
+        state_key = torch.einsum("nhvk,nhk->nhv", current_state, key)
+        delta = value - state_key
+        beta = inputs["raw_beta"][0].index_select(0, rows).float().sigmoid()
+        current_state += (delta * beta.unsqueeze(-1)).unsqueeze(-1) * key.unsqueeze(-2)
+        state.index_copy_(0, live_slots, current_state[live])
+        recurrent = torch.einsum("nhvk,nhk->nhv", current_state, query)
+        recurrent *= live.view(num_sequences, 1, 1)
+        output[0].index_copy_(0, rows, recurrent.to(torch.bfloat16))
+
+    output_float = output.float()
+    inverse_rms = torch.rsqrt(output_float.square().mean(-1, keepdim=True) + 1e-5)
+    return (
+        output_float
+        * inverse_rms
+        * inputs["norm_weight"]
+        * inputs["output_gate"].float().sigmoid().unsqueeze(0)
+    ).to(torch.bfloat16)
+
+
+def _make_packed_inputs(num_heads, num_sequences, num_tokens, seed=42):
+    inputs = _make_inputs(num_heads, num_sequences * num_tokens, seed=seed)
+    inputs["state_indices"] = inputs["state_indices"].reshape(num_sequences, num_tokens)
+    return inputs
+
+
 @pytest.mark.parametrize(
     ("num_heads", "num_rows"),
     [
@@ -322,3 +388,212 @@ def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
         kernel_module._get_compiled_kernel.cache_clear()
 
     assert len(kernel_names) == len(set(kernel_names)) == 4
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "num_sequences", "num_tokens"),
+    [
+        pytest.param(12, 1, 1, id="h12-n1-t1"),
+        pytest.param(12, 2, 1, id="h12-n2-t1-dynamic-batch"),
+        pytest.param(12, 2, 2, id="h12-n2-t2"),
+        pytest.param(24, 4, 3, id="h24-n4-t3"),
+        pytest.param(32, 2, 4, id="h32-n2-t4"),
+        pytest.param(48, 2, 8, id="h48-n2-t8"),
+        pytest.param(96, 1, 3, id="h96-n1-t3"),
+    ],
+)
+def test_fused_kda_decode_packed(num_heads, num_sequences, num_tokens):
+    inputs = _make_packed_inputs(num_heads, num_sequences, num_tokens)
+    reference_conv = _clone_strided(inputs["conv_state"])
+    reference_state = _clone_strided(inputs["state"])
+    actual_conv = _clone_strided(inputs["conv_state"])
+    actual_state = _clone_strided(inputs["state"])
+
+    expected = _packed_reference(inputs, reference_conv, reference_state)
+    actual = fused_kda_decode_packed(
+        **{**inputs, "conv_state": actual_conv, "state": actual_state}
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+    torch.testing.assert_close(actual_conv, reference_conv, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
+
+
+def test_fused_kda_decode_packed_t1_uses_legacy_modes():
+    inputs = _make_inputs(12, 2, state_dtype=torch.bfloat16)
+    inputs["state_indices"] = inputs["state_indices"].reshape(2, 1)
+    legacy_conv = _clone_strided(inputs["conv_state"])
+    legacy_state = _clone_strided(inputs["state"])
+    packed_conv = _clone_strided(inputs["conv_state"])
+    packed_state = _clone_strided(inputs["state"])
+
+    legacy = fused_kda_decode(
+        **{
+            **inputs,
+            "conv_state": legacy_conv,
+            "state": legacy_state,
+            "state_indices": inputs["state_indices"][:, 0],
+            "lower_bound": None,
+        }
+    )
+    packed = fused_kda_decode_packed(
+        **{
+            **inputs,
+            "conv_state": packed_conv,
+            "state": packed_state,
+            "lower_bound": None,
+        }
+    )
+
+    assert torch.equal(packed, legacy)
+    assert torch.equal(packed_conv, legacy_conv)
+    assert torch.equal(packed_state, legacy_state)
+
+
+@pytest.mark.parametrize(
+    ("state_dtype", "lower_bound", "error", "match"),
+    [
+        pytest.param(
+            torch.bfloat16,
+            -5.0,
+            TypeError,
+            "state must have dtype torch.float32",
+            id="bf16-state",
+        ),
+        pytest.param(
+            torch.float32,
+            None,
+            ValueError,
+            "lower_bound must be a finite negative float",
+            id="softplus",
+        ),
+    ],
+)
+def test_fused_kda_decode_packed_t2_rejects_legacy_only_modes(
+    state_dtype, lower_bound, error, match
+):
+    inputs = _make_inputs(12, 2, state_dtype=state_dtype)
+    inputs["state_indices"] = inputs["state_indices"].reshape(1, 2)
+
+    with pytest.raises(error, match=match):
+        fused_kda_decode_packed(**inputs, lower_bound=lower_bound)
+
+
+def test_fused_kda_decode_packed_rejects_unsupported_arch(monkeypatch):
+    import importlib
+
+    module = importlib.import_module(
+        "flashinfer.kda_kernels.fused_kda_decode_multitoken"
+    )
+    inputs = _make_packed_inputs(12, 1, 2)
+    monkeypatch.setattr(
+        module.torch.cuda, "get_device_capability", lambda _device: (9, 0)
+    )
+
+    with pytest.raises(NotImplementedError, match="requires SM10x"):
+        fused_kda_decode_packed(**inputs)
+
+
+def test_fused_kda_decode_packed_shared_memory_limit():
+    import importlib
+
+    module = importlib.import_module(
+        "flashinfer.kda_kernels.fused_kda_decode_multitoken"
+    )
+    limit = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    supported = 1
+    while (
+        module._required_smem_bytes(
+            supported + 1, *module._TILE_TALL[:2], module._TILE_TALL[3]
+        )
+        <= limit
+    ):
+        supported += 1
+
+    assert supported >= 96
+    assert (
+        module._required_smem_bytes(
+            supported, *module._TILE_TALL[:2], module._TILE_TALL[3]
+        )
+        <= limit
+    )
+    assert (
+        module._required_smem_bytes(
+            supported + 1, *module._TILE_TALL[:2], module._TILE_TALL[3]
+        )
+        > limit
+    )
+
+
+def test_fused_kda_decode_packed_null_row():
+    inputs = _make_packed_inputs(num_heads=12, num_sequences=2, num_tokens=3)
+    inputs["state_indices"][0].zero_()
+    reference_conv = _clone_strided(inputs["conv_state"])
+    reference_state = _clone_strided(inputs["state"])
+    actual_conv = _clone_strided(inputs["conv_state"])
+    actual_state = _clone_strided(inputs["state"])
+
+    expected = _packed_reference(inputs, reference_conv, reference_state)
+    actual = fused_kda_decode_packed(
+        **{**inputs, "conv_state": actual_conv, "state": actual_state}
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+    assert torch.count_nonzero(actual[:, :3]) == 0
+    torch.testing.assert_close(actual_conv, reference_conv, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
+
+
+def test_fused_kda_decode_packed_cuda_graph():
+    inputs = _make_packed_inputs(num_heads=12, num_sequences=2, num_tokens=3)
+    expected_conv = _clone_strided(inputs["conv_state"])
+    expected_state = _clone_strided(inputs["state"])
+    expected = _packed_reference(inputs, expected_conv, expected_state)
+    output = torch.empty_like(expected)
+    kwargs = {**inputs, "output": output}
+
+    fused_kda_decode_packed(**kwargs)
+    # Restore the exact seeded inputs rather than relying on capture-time state.
+    fresh = _make_packed_inputs(12, 2, 3)
+    inputs["conv_state"].copy_(fresh["conv_state"])
+    inputs["state"].copy_(fresh["state"])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_kda_decode_packed(**kwargs)
+    inputs["conv_state"].copy_(fresh["conv_state"])
+    inputs["state"].copy_(fresh["state"])
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=3e-2, atol=2e-2)
+    torch.testing.assert_close(inputs["conv_state"], expected_conv, rtol=0, atol=0)
+    torch.testing.assert_close(inputs["state"], expected_state, rtol=3e-2, atol=2e-3)
+
+
+def test_fused_kda_decode_packed_cache_key(monkeypatch):
+    import importlib
+
+    module = importlib.import_module(
+        "flashinfer.kda_kernels.fused_kda_decode_multitoken"
+    )
+    kernel_names = []
+
+    def record_kernel_name(module_name, kernel_name, compile_fn, extra_key_files):
+        del module_name, compile_fn, extra_key_files
+        kernel_names.append(kernel_name)
+        return kernel_name
+
+    monkeypatch.setattr(module, "build_and_load_cute_dsl_kernel", record_kernel_name)
+    module._get_compiled_kernel.cache_clear()
+    base = [3, 12, -5.0, 1e-5, 2, 16, 1, 1]
+    alternatives = [4, 24, -4.0, 2e-5, 1, 32, 2, 2]
+    try:
+        module._get_compiled_kernel(*base)
+        for index, alternative in enumerate(alternatives):
+            args = list(base)
+            args[index] = alternative
+            module._get_compiled_kernel(*args)
+    finally:
+        module._get_compiled_kernel.cache_clear()
+
+    assert len(kernel_names) == len(set(kernel_names)) == 1 + len(alternatives)
