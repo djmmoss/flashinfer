@@ -26,6 +26,7 @@ Exported:
 - run_recurrent_kda: Recurrent KDA standard decode and speculative decode backend
 - run_fused_kda_decode: Fused Kimi K3 conv, recurrent KDA, and RMSNorm backend
 - run_packed_kda_decode: Packed Kimi K3 T=1 recurrent decode backend
+- run_fused_kda_decode_multitoken: Packed T>=1 fused KDA backend
 """
 
 import torch as _torch
@@ -49,6 +50,14 @@ except (ImportError, RuntimeError):
 # only for tests and benchmarks.
 
 try:
+    from .fused_kda_decode_multitoken import run_fused_kda_decode_multitoken
+
+    fused_kda_decode_multitoken = run_fused_kda_decode_multitoken
+except (ImportError, RuntimeError):
+    run_fused_kda_decode_multitoken = None  # type: ignore
+    fused_kda_decode_multitoken = None  # type: ignore
+
+try:
     if _torch.cuda.is_available():
         from ..cute_dsl.utils import is_cute_dsl_arch_supported as _dsl_arch_ok
 
@@ -68,9 +77,11 @@ except (ImportError, RuntimeError):
 
 __all__ = [
     "fused_kda_decode",
+    "fused_kda_decode_multitoken",
     "packed_kda_decode",
     "recurrent_kda",
     "run_fused_kda_decode",
+    "run_fused_kda_decode_multitoken",
     "run_packed_kda_decode",
     "run_recurrent_kda",
 ]
